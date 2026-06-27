@@ -23,9 +23,16 @@ export function ProgressDialog({
   progress: HistoryProgress;
 }) {
   const analyzing = progress.phase === "analyzing" && progress.total > 0;
+  const aggregating = progress.phase === "aggregating";
   const percent = analyzing
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
     : 0;
+
+  const description = analyzing
+    ? "Computing and caching the games we don't have yet."
+    : aggregating
+      ? "Summarising the history from the local cache."
+      : "Locating the game on the chain and verifying it's genuine.";
 
   return (
     <Dialog open={open} onOpenChange={() => {}}>
@@ -36,11 +43,7 @@ export function ProgressDialog({
       >
         <DialogHeader>
           <DialogTitle>Computing history</DialogTitle>
-          <DialogDescription>
-            {analyzing
-              ? "Walking the chain and tallying every game."
-              : "Locating the game on the chain and verifying it's genuine."}
-          </DialogDescription>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-2">
@@ -52,6 +55,8 @@ export function ProgressDialog({
                 {progress.current.toLocaleString()} /{" "}
                 {progress.total.toLocaleString()} games ({percent}%)
               </span>
+            ) : aggregating ? (
+              <span>Crunching the numbers…</span>
             ) : (
               <span>{progress.current.toLocaleString()} hashes scanned…</span>
             )}
