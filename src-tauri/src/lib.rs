@@ -221,6 +221,91 @@ async fn run_query(
     .map_err(|e| format!("query failed to run: {e}"))?
 }
 
+/// A user-defined dashboard view: a name and a JSON dashboard spec (the same
+/// shape the built-in dashboard uses).
+#[derive(Serialize)]
+struct SavedView {
+    id: i64,
+    name: String,
+    spec: String,
+}
+
+/// Open the cache db and ensure the schema exists. Used by the lightweight view
+/// CRUD commands (no heavy CPU, so they run directly on the async runtime).
+async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, String> {
+    let path = db_path(app)?;
+    let db = libsql::Builder::new_local(path)
+        .build()
+        .await
+        .map_err(|e| format!("couldn't open cache db: {e}"))?;
+    let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+    ensure_schema(&conn).await?;
+    Ok(conn)
+}
+
+/// List all saved custom views (the built-in dashboard is not stored here).
+#[tauri::command]
+async fn list_views(app: tauri::AppHandle) -> Result<Vec<SavedView>, String> {
+    let conn = open_db_conn(&app).await?;
+    let mut rows = conn
+        .query("SELECT id, name, spec FROM views ORDER BY id", ())
+        .await
+        .map_err(|e| format!("couldn't list views: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().await.map_err(|e| format!("couldn't list views: {e}"))? {
+        let map = |e: libsql::Error| format!("couldn't read view: {e}");
+        out.push(SavedView {
+            id: r.get(0).map_err(map)?,
+            name: r.get(1).map_err(map)?,
+            spec: r.get(2).map_err(map)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Persist a new custom view; returns its id. `spec` must be valid JSON.
+#[tauri::command]
+async fn save_view(app: tauri::AppHandle, name: String, spec: String) -> Result<i64, String> {
+    serde_json::from_str::<Json>(&spec).map_err(|e| format!("view spec isn't valid JSON: {e}"))?;
+    let conn = open_db_conn(&app).await?;
+    conn.execute(
+        "INSERT INTO views(name, spec) VALUES (?1, ?2)",
+        libsql::params![name, spec],
+    )
+    .await
+    .map_err(|e| format!("couldn't save view: {e}"))?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Update an existing custom view in place. `spec` must be valid JSON.
+#[tauri::command]
+async fn update_view(
+    app: tauri::AppHandle,
+    id: i64,
+    name: String,
+    spec: String,
+) -> Result<(), String> {
+    serde_json::from_str::<Json>(&spec).map_err(|e| format!("view spec isn't valid JSON: {e}"))?;
+    let conn = open_db_conn(&app).await?;
+    conn.execute(
+        "UPDATE views SET name = ?2, spec = ?3 WHERE id = ?1",
+        libsql::params![id, name, spec],
+    )
+    .await
+    .map_err(|e| format!("couldn't update view: {e}"))?;
+    Ok(())
+}
+
+/// Delete a custom view.
+#[tauri::command]
+async fn delete_view(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let conn = open_db_conn(&app).await?;
+    conn.execute("DELETE FROM views WHERE id = ?1", libsql::params![id])
+        .await
+        .map_err(|e| format!("couldn't delete view: {e}"))?;
+    Ok(())
+}
+
 /// Convert an incoming JSON parameter to a libSQL bind value.
 fn json_to_libsql(v: Json) -> libsql::Value {
     match v {
@@ -294,6 +379,11 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
              hash       TEXT    NOT NULL UNIQUE,\n\
              bust_centi INTEGER NOT NULL,\n\
              is_green   INTEGER NOT NULL\n\
+         );\n\
+         CREATE TABLE IF NOT EXISTS views (\n\
+             id   INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+             name TEXT NOT NULL,\n\
+             spec TEXT NOT NULL\n\
          );",
     )
     .await
@@ -538,7 +628,11 @@ pub fn run() {
             greet,
             bust_from_hash,
             compute_history,
-            run_query
+            run_query,
+            list_views,
+            save_view,
+            update_view,
+            delete_view
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -708,6 +802,33 @@ mod tests {
         assert_eq!(rows[0]["games"].as_i64().unwrap(), 6);
         assert!(rows[0]["mean"].as_f64().unwrap() >= 1.0);
         assert!(rows[0]["h"].is_string());
+    }
+
+    #[tokio::test]
+    async fn views_crud() {
+        let conn = mem_conn().await;
+        conn.execute(
+            "INSERT INTO views(name, spec) VALUES (?1, ?2)",
+            libsql::params!["My view", "{\"rows\":[]}"],
+        )
+        .await
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        let mut rows = conn
+            .query("SELECT id, name, spec FROM views WHERE id = ?1", libsql::params![id])
+            .await
+            .unwrap();
+        let r = rows.next().await.unwrap().unwrap();
+        assert_eq!(r.get::<String>(1).unwrap(), "My view");
+
+        conn.execute("UPDATE views SET name = ?2 WHERE id = ?1", libsql::params![id, "Renamed"])
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM views WHERE id = ?1", libsql::params![id])
+            .await
+            .unwrap();
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM views", vec![]).await, 0);
     }
 
     #[tokio::test]

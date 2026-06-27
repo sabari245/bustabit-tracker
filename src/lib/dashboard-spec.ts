@@ -28,13 +28,23 @@ export type ChartWidgetSpec = {
   /** Shown above the chart when embedded in a tab. */
   note?: string;
   sql: string;
-  /** Category/X column name. */
-  x: string;
-  series: Series[];
+  /** Category/X column name. Auto-detected (first column) when omitted. */
+  x?: string;
+  /** Series to plot. Auto-derived (the numeric columns) when omitted. */
+  series?: Series[];
   refLine?: number;
   yUnit?: string;
   yDomain?: [number, number];
 };
+
+/** Palette for auto-derived chart series (user-authored views). */
+export const CHART_PALETTE = [
+  "var(--chart-1)",
+  "var(--chart-2)",
+  "var(--chart-3)",
+  "var(--chart-4)",
+  "var(--chart-5)",
+];
 
 export type TabSpec = { value: string; label: string; chart: ChartWidgetSpec };
 

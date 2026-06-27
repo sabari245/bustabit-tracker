@@ -29,10 +29,44 @@ import {
 } from "@/components/ui/chart";
 import { Skeleton } from "@/components/ui/skeleton";
 import { runQuery, type Row } from "@/lib/query";
-import type { ChartWidgetSpec } from "@/lib/dashboard-spec";
+import {
+  CHART_PALETTE,
+  type ChartWidgetSpec,
+  type Series,
+} from "@/lib/dashboard-spec";
 
-function renderChart(widget: ChartWidgetSpec, data: Row[]): ReactElement {
-  const showLegend = widget.series.length > 1;
+/**
+ * Resolve the x column and series for a chart. Explicit spec values win;
+ * otherwise we derive them from the result columns so user-authored widgets
+ * only need to supply SQL: first column = category/x, numeric columns = series.
+ */
+function resolveAxes(
+  widget: ChartWidgetSpec,
+  data: Row[],
+): { x: string; series: Series[] } {
+  const cols = data.length > 0 ? Object.keys(data[0]) : [];
+  const x = widget.x ?? cols[0] ?? "x";
+  if (widget.series && widget.series.length > 0) {
+    return { x, series: widget.series };
+  }
+  const numeric = cols.filter(
+    (c) => c !== x && data.some((r) => typeof r[c] === "number"),
+  );
+  const series = numeric.map((c, i) => ({
+    key: c,
+    label: c,
+    color: CHART_PALETTE[i % CHART_PALETTE.length],
+  }));
+  return { x, series };
+}
+
+function renderChart(
+  widget: ChartWidgetSpec,
+  data: Row[],
+  x: string,
+  series: Series[],
+): ReactElement {
+  const showLegend = series.length > 1;
   const yProps = {
     tickLine: false,
     axisLine: false,
@@ -45,11 +79,11 @@ function renderChart(widget: ChartWidgetSpec, data: Row[]): ReactElement {
     return (
       <BarChart data={data}>
         <CartesianGrid vertical={false} />
-        <XAxis dataKey={widget.x} tickLine={false} axisLine={false} />
+        <XAxis dataKey={x} tickLine={false} axisLine={false} />
         <YAxis {...yProps} />
-        <ChartTooltip content={<ChartTooltipContent labelKey={widget.x} />} />
+        <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
         {showLegend && <ChartLegend content={<ChartLegendContent />} />}
-        {widget.series.map((s) => (
+        {series.map((s) => (
           <Bar key={s.key} dataKey={s.key} fill={`var(--color-${s.key})`} radius={4} />
         ))}
       </BarChart>
@@ -60,11 +94,11 @@ function renderChart(widget: ChartWidgetSpec, data: Row[]): ReactElement {
     return (
       <AreaChart data={data}>
         <CartesianGrid vertical={false} />
-        <XAxis dataKey={widget.x} tickLine={false} axisLine={false} />
+        <XAxis dataKey={x} tickLine={false} axisLine={false} />
         <YAxis {...yProps} />
-        <ChartTooltip content={<ChartTooltipContent labelKey={widget.x} />} />
+        <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
         {showLegend && <ChartLegend content={<ChartLegendContent />} />}
-        {widget.series.map((s) => (
+        {series.map((s) => (
           <Area
             key={s.key}
             dataKey={s.key}
@@ -81,9 +115,9 @@ function renderChart(widget: ChartWidgetSpec, data: Row[]): ReactElement {
   return (
     <LineChart data={data}>
       <CartesianGrid vertical={false} />
-      <XAxis dataKey={widget.x} tickLine={false} axisLine={false} />
+      <XAxis dataKey={x} tickLine={false} axisLine={false} />
       <YAxis {...yProps} />
-      <ChartTooltip content={<ChartTooltipContent labelKey={widget.x} />} />
+      <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
       {showLegend && <ChartLegend content={<ChartLegendContent />} />}
       {widget.refLine != null && (
         <ReferenceLine
@@ -92,7 +126,7 @@ function renderChart(widget: ChartWidgetSpec, data: Row[]): ReactElement {
           stroke="var(--muted-foreground)"
         />
       )}
-      {widget.series.map((s) => (
+      {series.map((s) => (
         <Line
           key={s.key}
           dataKey={s.key}
@@ -130,17 +164,20 @@ export function ChartWidget({
     };
   }, [widget.sql, game]);
 
+  const { x, series } = resolveAxes(widget, data ?? []);
   const config: ChartConfig = Object.fromEntries(
-    widget.series.map((s) => [s.key, { label: s.label, color: s.color }]),
+    series.map((s) => [s.key, { label: s.label, color: s.color }]),
   );
 
   const body = error ? (
     <p className="text-sm text-destructive">{error}</p>
   ) : !data ? (
     <Skeleton className="h-[300px] w-full" />
+  ) : data.length === 0 || series.length === 0 ? (
+    <p className="text-sm text-muted-foreground">No data to plot.</p>
   ) : (
     <ChartContainer config={config} className="h-[300px] w-full">
-      {renderChart(widget, data)}
+      {renderChart(widget, data, x, series)}
     </ChartContainer>
   );
 

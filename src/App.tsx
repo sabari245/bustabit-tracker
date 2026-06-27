@@ -14,8 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Navbar } from "@/components/navbar";
 import { ThemeProvider } from "@/components/theme-provider";
-import { DashboardRenderer } from "@/components/dashboard-renderer";
-import { DASHBOARD } from "@/lib/dashboard-spec";
+import { DashboardSection } from "@/components/dashboard-section";
 import {
   ProgressDialog,
   type HistoryProgress,
@@ -106,7 +105,7 @@ function App() {
             </CardContent>
           </Card>
 
-          {game != null && <DashboardRenderer spec={DASHBOARD} game={game} />}
+          {game != null && <DashboardSection game={game} />}
         </main>
       </div>
     </ThemeProvider>
