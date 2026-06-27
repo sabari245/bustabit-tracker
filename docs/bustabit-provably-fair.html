@@ -1,0 +1,105 @@
+<!-- LLM-only reference. Minimal, dense. Not for human reading. Topic: bustabit provably-fair crash algorithm. -->
+<meta charset="utf-8">
+<title>bustabit provably-fair — LLM reference</title>
+
+<h1>bustabit provably-fair: hash chain + crash point</h1>
+<p>Status: re-derived 2026-06-27 against bustabit's OWN verifier source (authoritative): github.com/bustabit/verifier — files src/constants.ts, src/utils/math.ts, src/utils/vx.ts, src/verifier.worker.ts. All constants/algorithm below are copied from that source. [confidence: high — this is the canonical impl]</p>
+<p><b>Critical:</b> there are THREE eras on two hash chains, each with a different HMAC key and a different chain-walk encoding. Using the wrong era's salt/encoding silently produces a plausible-but-wrong bust. This was the original bug in this repo.</p>
+
+<h2>1. Hash chain</h2>
+<ul>
+<li>Each game has a server seed = a 64-hex SHA-256 value ("game hash").</li>
+<li>Chain is precommitted and consumed in REVERSE. prevGameHash = SHA256(currentGameHash). i.e. hashing game N's hash yields game N-1's hash.</li>
+<li>So: game #1 used the LAST-generated hash; the first generated hash (terminating/inception hash) is the last game played in that chain.</li>
+<li><b>Chain-walk encoding differs by chain</b> (verifier.worker.ts):
+  <ul>
+  <li>PREVIOUS chain (v2, games 1..10,000,000): SHA256 of the <b>hex STRING</b> — <code>sha256(bytesToHex(hash))</code>.</li>
+  <li>CURRENT chain (games &gt; 10,000,000): SHA256 of the <b>RAW 32 bytes</b> — <code>sha256(hash)</code>.</li>
+  </ul>
+  Walking a current-chain hash with hex-string encoding (or vice-versa) will never reach the terminating hash.</li>
+<li>Verify a hash belongs to game offset k from the end: SHA256 it k times (correct encoding) → must equal the published terminating hash for that chain.</li>
+</ul>
+
+<h2>2. Chains, lengths, terminating hashes (from constants.ts)</h2>
+<table border=1 cellpadding=4>
+<tr><th>Chain</th><th>Game numbers</th><th>Terminating hash</th></tr>
+<tr><td>previous (v2)</td><td>1 .. 10,000,000 (PREV_CHAIN_LENGTH)</td><td><code>86728f5fc3bd99db94d3cdaf105d67788194e9701bf95d049ad0e1ee3d004277</code> (PREV_TERMINATING_HASH)</td></tr>
+<tr><td>current</td><td>10,000,001 .. end</td><td><code>567a98370fb7545137ddb53687723cf0b8a1f5e93b1f76f4a1da29416930fa59</code> (TERMINATING_HASH)</td></tr>
+</table>
+
+<h2>3. HMAC keys per era — THIS is where impls go wrong</h2>
+<p>The crash formula (§4) is identical across eras; only the HMAC <b>key</b> (and, for Vx, how it's derived) changes. The HMAC <b>message is ALWAYS the raw 32-byte game hash</b> (NOT the hex string).</p>
+<table border=1 cellpadding=4>
+<tr><th>Era</th><th>Game range</th><th>HMAC key</th><th>conf</th></tr>
+<tr><td>v2 (previous chain)</td><td>1 .. 10,000,000</td><td>PREV_GAME_SALT as UTF-8 bytes of the hex string<br><code>0000000000000000004d6ec16dafe9d8370958664c1dc422f452892264c59526</code> (Bitcoin block 505750)</td><td>high</td></tr>
+<tr><td>Vx (current chain, early)</td><td>10,000,001 .. 12,279,450 (VX_LAST_GAME)</td><td>per-game BLS signature (see §5). NOT a static salt.</td><td>high</td></tr>
+<tr><td>classic (current chain, now)</td><td>12,279,451 .. end</td><td>GAME_SALT as UTF-8 bytes of the hex string<br><code>00000000000000000001e08b7fd44f95e3e950ac65650a8031a6d5e1750e34be</code> (4th seeding event, bitcointalk topic 5560454)</td><td>high</td></tr>
+</table>
+<p>Note: PREV_GAME_SALT / GAME_SALT are passed to HMAC as the 64-char hex STRING's UTF-8 bytes (the string is the key, not hex-decoded). Only the MESSAGE is hex-decoded to raw bytes. (math.ts: <code>hmac(sha256, key, gameHash)</code> where key=salt string and gameHash=hexToBytes(hashHex).)</p>
+<p>The Vx salt from the 3rd seeding event — <code>000000000000000000011f6e135efe67d7463dfe7bb955663ef88b1243b2deea</code> (block 831500, VX_GAME_SALT) — is NOT an HMAC key. It is the <i>clientSeed</i> fed into the BLS signing step (§5). Do not use it directly as a key.</p>
+
+<h2>4. Crash point from hash — CANONICAL algorithm (math.ts, verbatim)</h2>
+<p>House edge (~1%) is baked into the constant 99. There is NO separate divisible-by-101 instant-bust check — that older MoneyPot/v1 variant is NOT what bustabit runs.</p>
+<pre>
+function gameResult(key, gameHash) {   // key = salt-string-bytes or BLS signature; gameHash = raw 32 bytes
+  const nBits = 52;
+  const hash = bytesToHex(hmac(sha256, key, gameHash));  // HMAC-SHA256(key, msg=raw hash bytes)
+  const r = parseInt(hash.slice(0, nBits / 4), 16);      // first 13 hex chars = top 52 bits
+  let X = r / Math.pow(2, nBits);                         // 2^52 = 4503599627370496; X in [0,1)
+  X = 99 / (1 - X);                                       // edge in the 99; (1-X) avoids div-by-zero
+  return Math.max(1, Math.floor(X) / 100);               // floor to 2 decimals, min 1.00x
+}
+</pre>
+<p>Constants summary: HMAC-SHA256; key=era salt/signature; <b>msg=raw 32-byte hash</b>; 52-bit mask 2^52=4503599627370496; first 13 hex chars; formula 99/(1-X); floor; min 1.00. ~1% of games floor below 1.00 and clamp to 1.00 (that IS the instant-bust / edge).</p>
+
+<h2>4b. Common WRONG variants (do NOT use)</h2>
+<ul>
+<li><b>divisible-by-101 + 100-numerator</b>: <code>if(divisible(hash,101))return 1.00; floor((100*2^52 - h)/(2^52 - h))/100</code>. This is the old MoneyPot/bustabit-v1 algorithm. Gives results 0.01 higher than §4 and a literal 1.00 spike. bustabit does NOT use it.</li>
+<li><b>message = hex string</b>: feeding the 64-char hex string to HMAC instead of the 32 raw bytes. Wrong digest entirely.</li>
+<li><b>wrong-era salt</b>: using v2 salt for a current-chain game (or vice-versa), or using VX_GAME_SALT as an HMAC key. Wrong digest entirely.</li>
+</ul>
+
+<h2>5. Vx era (BLS) — games 10,000,001 .. 12,279,450 (vx.ts)</h2>
+<p>During the Vx era the HMAC key is a per-game BLS12-381 signature, not a static salt. Reproducible because the private key was published after the era ended.</p>
+<pre>
+// constants.ts
+VX_GAME_SALT = "000000000000000000011f6e135efe67d7463dfe7bb955663ef88b1243b2deea"  // clientSeed (block 831500)
+VX_PUB_KEY   = "b40c94495f6e6e73619aeb54ec2fc84c5333f7a88ace82923946fc5b6c8635b08f9130888dd96e1749a1d5aab00020e4"
+VX_PRIV_KEY  = "1f0373e57723f4b862f2b9bd1279c9c6dcea73469fce6dcab9524b609c9c60f4"
+VX_LAST_GAME = 12279450
+
+// vx.ts: derive the HMAC key (a BLS signature) for a Vx-era game
+function getVxSignature(clientSeed /*=VX_GAME_SALT*/, gameHash /*raw bytes*/) {
+  const message = concatBytes(sha256(gameHash), utf8ToBytes(clientSeed));   // sha256(rawHash) || clientSeed
+  const hashed  = bls12_381.longSignatures.hash(message);
+  const signature = bls12_381.longSignatures.sign(hashed, hexToBytes(VX_PRIV_KEY)).toBytes(true);
+  return signature;   // pass as `key` to gameResult(§4)
+}
+</pre>
+<p>Library: @noble/curves bls12-381 longSignatures (min-pubkey-size variant). Rust equiv would need a bls12-381 crate; only required to verify the ~2.28M Vx-era games.</p>
+
+<h2>6. Worked verification recipe</h2>
+<ol>
+<li>Determine the game NUMBER (decides era + chain-walk encoding).</li>
+<li>Pick key per §3: v2→PREV_GAME_SALT; Vx→getVxSignature(§5); classic→GAME_SALT.</li>
+<li>gameResult(key, hexToBytes(hash)) (§4) → should equal published bust.</li>
+<li>Chain walk with the correct encoding (§1) k times → terminating hash for that chain (§2).</li>
+</ol>
+<p>Reference checked: hash <code>df5d54b8ca42cb40ea80e8ba74b3281f7b9d49bc27fecbe104847de1e91e4929</code> (current classic era) → GAME_SALT key + raw-bytes msg + §4 → <b>38.65x</b> (matches site). Same hash via the old v2-salt/hex-string/divisible path → 16.67x (wrong).</p>
+
+<h2>7. Sources</h2>
+<ul>
+<li><b>bustabit/verifier (AUTHORITATIVE)</b> — https://github.com/bustabit/verifier (src/constants.ts, src/utils/math.ts, src/utils/vx.ts, src/verifier.worker.ts)</li>
+<li>live verifier — https://bustabit.github.io/verifier/</li>
+<li>4th seeding event (current GAME_SALT) — https://bitcointalk.org/index.php?topic=5560454</li>
+<li>3rd seeding event (Vx, VX_GAME_SALT, BLS) — https://bitcointalk.org/index.php?topic=5485695</li>
+<li>2nd seeding event (v2, PREV_GAME_SALT) — https://bitcointalk.org/index.php?topic=2807542</li>
+</ul>
+
+<h2>8. Cautions</h2>
+<ul>
+<li>Game number is required to pick the era — a bare hash is ambiguous. If only a hash is known, default to current classic (GAME_SALT); it will be wrong for v2/Vx games.</li>
+<li>HMAC message is RAW bytes; salt key is the hex STRING's UTF-8 bytes. Don't mix these up.</li>
+<li>Vx era needs BLS12-381; without it, games 10,000,001..12,279,450 can't be reproduced.</li>
+<li>Re-derive one live game end-to-end after any change.</li>
+</ul>
