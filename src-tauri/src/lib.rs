@@ -1,7 +1,9 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use hmac::{Hmac, Mac};
 use serde::Serialize;
+use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use tauri::{Emitter, Manager};
 
 /// How often (in iterations) to emit a progress event during the walk. A power
@@ -41,7 +43,7 @@ const MAX_WALK: u64 = 20_000_000;
 // auto-cashout wins iff the game reaches 2.00×, so green = [2.00, ∞) and red (a
 // loss) = [1.00, 2.00) — including the 1.00× instant bust. (bustabit's verifier
 // uses 1.98 purely as a cosmetic table-row color, which would mislabel 1.98/1.99
-// as wins; we don't.) The 200 boundary is hardcoded in the aggregation SQL.
+// as wins; we don't.) The 200 boundary lives in the dashboard's SQL spec.
 
 /// Current ("classic") HMAC salt = hash of the Bitcoin block from bustabit's 4th
 /// seeding event (bitcointalk topic 5560454). This is the salt live games use
@@ -101,33 +103,8 @@ fn bust_from_hash(game_hash: &str) -> Result<f64, String> {
     compute_bust(game_hash)
 }
 
-/// One bar of the bust-value distribution histogram.
-#[derive(Serialize)]
-struct DistBucket {
-    label: String,
-    count: u64,
-}
-
-/// One row of the streak-length distribution (how many green vs red runs had a
-/// length falling in this bucket).
-#[derive(Serialize)]
-struct StreakBucket {
-    label: String,
-    green: u64,
-    red: u64,
-}
-
-/// Exact count of streaks that were precisely `length` long. Used for the
-/// dedicated red-streak analysis (frequency / survival / continuation charts).
-#[derive(Serialize)]
-struct LenCount {
-    length: u64,
-    count: u64,
-}
-
 /// Progress event payload emitted during the walk. `total` is 0 while locating
-/// the game (the length isn't known yet) and while aggregating; it's the game
-/// count while analyzing/filling.
+/// the game (the length isn't known yet); it's the game count while analyzing.
 #[derive(Clone, Serialize)]
 struct Progress {
     phase: String,
@@ -135,65 +112,37 @@ struct Progress {
     total: u64,
 }
 
-/// Aggregated stats for the classic-era history of a chain, from `CLASSIC_START`
-/// up to the entered game. Everything is summarised in SQL so we never ship the
-/// millions of individual rounds to the frontend.
+/// Result of preparing a history lookup: the cache is now populated for the whole
+/// classic range up to `from_game`. The dashboard turns this into the upper bound
+/// it binds into every widget's SQL query.
 #[derive(Serialize)]
-struct HistoryStats {
+struct Prepared {
     from_game: u64,
     to_game: u64,
     total_games: u64,
-    green_count: u64,
-    red_count: u64,
-    instant_busts: u64,
-    mean_bust: f64,
-    max_bust: f64,
-    max_bust_game: u64,
-    longest_green_streak: u64,
-    longest_red_streak: u64,
-    current_streak_len: u64,
-    current_streak_green: bool,
-    distribution: Vec<DistBucket>,
-    streaks: Vec<StreakBucket>,
-    /// Exact red-streak length histogram (index 0 = length 1, up to the longest
-    /// red streak). Frontend derives survival & continuation curves from this.
-    red_streak_hist: Vec<LenCount>,
 }
 
-/// Bucket index for a streak length. Boundaries: 1, 2, 3, 4, 5, 6–10, 11–20, 21+.
-fn streak_index(len: u64) -> usize {
-    match len {
-        1 => 0,
-        2 => 1,
-        3 => 2,
-        4 => 3,
-        5 => 4,
-        6..=10 => 5,
-        11..=20 => 6,
-        _ => 7,
-    }
-}
-
-/// Walk the current chain backward from `game_hash`, persisting every classic
-/// game's bust into a local SQLite (libSQL) cache and summarising the history
-/// with SQL. The game number is derived (not supplied) by locating the hash on
-/// the chain; thanks to the cache, repeat lookups only walk/compute the games
-/// that aren't stored yet.
-///
-/// This is an `async` command and the heavy walk + DB work run via
-/// `spawn_blocking` on a background thread (with its own single-threaded Tokio
-/// runtime), so the window stays responsive (no Windows "Not Responding") during
-/// the multi-million-hash computation.
-#[tauri::command]
-async fn compute_history(app: tauri::AppHandle, game_hash: String) -> Result<HistoryStats, String> {
-    // Resolve the on-disk cache location on the async side (needs AppHandle).
+/// Resolve (and create) the on-disk cache path: `<app data dir>/history.db`.
+fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("couldn't resolve app data dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't create data dir: {e}"))?;
-    let db_path = dir.join("history.db");
+    Ok(dir.join("history.db"))
+}
 
+/// Prepare a history lookup: derive the game number from the hash, then make sure
+/// every classic game up to it is computed and cached. Returns the range bounds;
+/// the dashboard queries the actual stats from the cache via `run_query`.
+///
+/// Thanks to the cache, repeat/newer lookups only walk and compute the games that
+/// aren't stored yet. The heavy walk + DB work run via `spawn_blocking` on a
+/// background thread (with its own single-threaded Tokio runtime), so the window
+/// stays responsive (no Windows "Not Responding") during a cold computation.
+#[tauri::command]
+async fn compute_history(app: tauri::AppHandle, game_hash: String) -> Result<Prepared, String> {
+    let db_path = db_path(&app)?;
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // A dedicated current-thread runtime, independent of Tauri's, lets us
@@ -235,6 +184,100 @@ async fn compute_history(app: tauri::AppHandle, game_hash: String) -> Result<His
     })
     .await
     .map_err(|e| format!("history computation failed to run: {e}"))?
+}
+
+/// Run an arbitrary read-only SQL query against the cache and return the rows as
+/// JSON objects (column name -> value). This is the engine that powers the
+/// schema-driven dashboard: every card and chart is just a SELECT in the JSON
+/// spec, bound with the entered game number.
+///
+/// `PRAGMA query_only` makes the connection reject any mutation at the engine
+/// level, so even a malformed/hostile query string can't write to the cache.
+#[tauri::command]
+async fn run_query(
+    app: tauri::AppHandle,
+    sql: String,
+    params: Vec<Json>,
+) -> Result<Vec<serde_json::Map<String, Json>>, String> {
+    let db_path = db_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime init failed: {e}"))?;
+        rt.block_on(async move {
+            let db = libsql::Builder::new_local(db_path)
+                .build()
+                .await
+                .map_err(|e| format!("couldn't open cache db: {e}"))?;
+            let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+            conn.execute("PRAGMA query_only = ON", ())
+                .await
+                .map_err(|e| format!("couldn't set read-only mode: {e}"))?;
+            query_rows(&conn, &sql, params).await
+        })
+    })
+    .await
+    .map_err(|e| format!("query failed to run: {e}"))?
+}
+
+/// Convert an incoming JSON parameter to a libSQL bind value.
+fn json_to_libsql(v: Json) -> libsql::Value {
+    match v {
+        Json::Null => libsql::Value::Null,
+        Json::Bool(b) => libsql::Value::Integer(b as i64),
+        Json::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                libsql::Value::Integer(i)
+            } else {
+                libsql::Value::Real(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Json::String(s) => libsql::Value::Text(s),
+        other => libsql::Value::Text(other.to_string()),
+    }
+}
+
+/// Convert a libSQL cell value to JSON for the frontend.
+fn libsql_to_json(v: libsql::Value) -> Json {
+    match v {
+        libsql::Value::Null => Json::Null,
+        libsql::Value::Integer(i) => Json::from(i),
+        libsql::Value::Real(f) => serde_json::Number::from_f64(f)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
+        libsql::Value::Text(s) => Json::String(s),
+        libsql::Value::Blob(b) => Json::String(hex::encode(b)),
+    }
+}
+
+/// Execute a SELECT and collect rows into JSON objects keyed by column name.
+async fn query_rows(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: Vec<Json>,
+) -> Result<Vec<serde_json::Map<String, Json>>, String> {
+    let binds: Vec<libsql::Value> = params.into_iter().map(json_to_libsql).collect();
+    let mut rows = conn
+        .query(sql, libsql::params_from_iter(binds))
+        .await
+        .map_err(|e| format!("query failed: {e}"))?;
+
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|e| format!("query failed: {e}"))? {
+        let mut obj = serde_json::Map::new();
+        let cols = row.column_count();
+        for i in 0..cols {
+            let name = row
+                .column_name(i)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("col{i}"));
+            let val = row.get_value(i).map_err(|e| format!("query failed: {e}"))?;
+            obj.insert(name, libsql_to_json(val));
+        }
+        out.push(obj);
+    }
+    Ok(out)
 }
 
 /// Create the cache table (idempotent) and set pragmas tuned for bulk inserts.
@@ -394,8 +437,8 @@ async fn fill_range(
 
 /// Orchestrate a history lookup against the cache `conn`: derive the game number
 /// (cache fast-path, else incremental locate), fill any missing classic games,
-/// then summarise with SQL. Parameterised on the chain anchors so tests can run
-/// it end-to-end against a synthetic chain in an in-memory database.
+/// and return the range bounds. Parameterised on the chain anchors so tests can
+/// run it end-to-end against a synthetic chain in an in-memory database.
 async fn run_history(
     conn: &libsql::Connection,
     game_hash: &str,
@@ -404,7 +447,7 @@ async fn run_history(
     classic_start: u64,
     max_walk: u64,
     report: &dyn Fn(&str, u64, u64),
-) -> Result<HistoryStats, String> {
+) -> Result<Prepared, String> {
     let game_hash = game_hash.trim();
     if game_hash.len() != 64 || !game_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("game_hash must be a 64-character hex string".to_string());
@@ -437,191 +480,10 @@ async fn run_history(
         fill_range(conn, &start, game_number, lower, report).await?;
     }
 
-    report("aggregating", 0, 0);
-    aggregate(conn, game_number, classic_start).await
-}
-
-/// Map a libSQL error to a user-facing aggregation error. A free function (not a
-/// closure) so it's `Copy` and can be handed to many `map_err` calls.
-fn agg_err(e: libsql::Error) -> String {
-    format!("aggregation failed: {e}")
-}
-
-/// Summarise the cached classic history up to `game_number` entirely in SQL.
-/// Returns small result sets only (scalars + a few hundred run-length groups),
-/// never the millions of individual rows.
-async fn aggregate(
-    conn: &libsql::Connection,
-    game_number: u64,
-    classic_start: u64,
-) -> Result<HistoryStats, String> {
-    let g = game_number as i64;
-
-    // --- Scalars ---
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(bust_centi >= 200), 0),
-                    COALESCE(SUM(bust_centi <= 100), 0),
-                    COALESCE(AVG(bust_centi), 0),
-                    COALESCE(MAX(bust_centi), 100)
-             FROM games WHERE game_id <= ?1",
-            libsql::params![g],
-        )
-        .await
-        .map_err(agg_err)?;
-    let r = rows.next().await.map_err(agg_err)?.ok_or("aggregation returned no rows")?;
-    let total: i64 = r.get(0).map_err(agg_err)?;
-    let green: i64 = r.get(1).map_err(agg_err)?;
-    let instant: i64 = r.get(2).map_err(agg_err)?;
-    let mean_centi: f64 = r.get(3).map_err(agg_err)?;
-    let max_centi: i64 = r.get(4).map_err(agg_err)?;
-    if total == 0 {
-        return Err("no classic games found for this hash".to_string());
-    }
-
-    // Which game hit the max bust (newest such game if tied).
-    let mut rows = conn
-        .query(
-            "SELECT game_id FROM games WHERE game_id <= ?1 AND bust_centi = ?2
-             ORDER BY game_id DESC LIMIT 1",
-            libsql::params![g, max_centi],
-        )
-        .await
-        .map_err(agg_err)?;
-    let max_bust_game = match rows.next().await.map_err(agg_err)? {
-        Some(r) => r.get::<i64>(0).map_err(agg_err)? as u64,
-        None => game_number,
-    };
-
-    // --- Bust-value distribution (<2, 2–5, 5–10, 10–100, ≥100) ---
-    let mut rows = conn
-        .query(
-            "SELECT COALESCE(SUM(bust_centi < 200), 0),
-                    COALESCE(SUM(bust_centi >= 200 AND bust_centi < 500), 0),
-                    COALESCE(SUM(bust_centi >= 500 AND bust_centi < 1000), 0),
-                    COALESCE(SUM(bust_centi >= 1000 AND bust_centi < 10000), 0),
-                    COALESCE(SUM(bust_centi >= 10000), 0)
-             FROM games WHERE game_id <= ?1",
-            libsql::params![g],
-        )
-        .await
-        .map_err(agg_err)?;
-    let r = rows.next().await.map_err(agg_err)?.ok_or("distribution returned no rows")?;
-    let dist_counts = [
-        r.get::<i64>(0).map_err(agg_err)? as u64,
-        r.get::<i64>(1).map_err(agg_err)? as u64,
-        r.get::<i64>(2).map_err(agg_err)? as u64,
-        r.get::<i64>(3).map_err(agg_err)? as u64,
-        r.get::<i64>(4).map_err(agg_err)? as u64,
-    ];
-
-    // --- Streaks via gaps-and-islands ---
-    // Consecutive same-colour games share (green, game_id - row_number()); group
-    // by that to get each run, then group runs by (green, length).
-    let mut rows = conn
-        .query(
-            "WITH g AS (
-                 SELECT game_id, CASE WHEN bust_centi >= 200 THEN 1 ELSE 0 END AS green
-                 FROM games WHERE game_id <= ?1
-             ),
-             grp AS (
-                 SELECT game_id, green,
-                        game_id - ROW_NUMBER() OVER (PARTITION BY green ORDER BY game_id) AS island
-                 FROM g
-             ),
-             runs AS (
-                 SELECT green, COUNT(*) AS len, MAX(game_id) AS hi
-                 FROM grp GROUP BY green, island
-             )
-             SELECT green, len, COUNT(*) AS cnt, MAX(hi) AS max_hi
-             FROM runs GROUP BY green, len ORDER BY green, len",
-            libsql::params![g],
-        )
-        .await
-        .map_err(agg_err)?;
-
-    let mut green_streaks = [0u64; 8];
-    let mut red_streaks = [0u64; 8];
-    let mut red_exact: Vec<u64> = Vec::new();
-    let mut longest_green = 0u64;
-    let mut longest_red = 0u64;
-    let mut current_streak_len = 0u64;
-    let mut current_streak_green = false;
-
-    while let Some(row) = rows.next().await.map_err(agg_err)? {
-        let is_green = row.get::<i64>(0).map_err(agg_err)? == 1;
-        let len = row.get::<i64>(1).map_err(agg_err)? as u64;
-        let cnt = row.get::<i64>(2).map_err(agg_err)? as u64;
-        let max_hi = row.get::<i64>(3).map_err(agg_err)? as u64;
-        let idx = streak_index(len);
-        if is_green {
-            green_streaks[idx] += cnt;
-            longest_green = longest_green.max(len);
-        } else {
-            red_streaks[idx] += cnt;
-            longest_red = longest_red.max(len);
-            let i = (len - 1) as usize;
-            if i >= red_exact.len() {
-                red_exact.resize(i + 1, 0);
-            }
-            red_exact[i] += cnt;
-        }
-        // The run containing the newest game ends exactly at game_number; that's
-        // the "current" streak shown for the entered game.
-        if max_hi == game_number {
-            current_streak_len = len;
-            current_streak_green = is_green;
-        }
-    }
-
-    let dist_labels = ["<2×", "2–5×", "5–10×", "10–100×", "≥100×"];
-    let distribution = dist_labels
-        .iter()
-        .enumerate()
-        .map(|(i, l)| DistBucket {
-            label: l.to_string(),
-            count: dist_counts[i],
-        })
-        .collect();
-
-    let streak_labels = ["1", "2", "3", "4", "5", "6–10", "11–20", "21+"];
-    let streaks = streak_labels
-        .iter()
-        .enumerate()
-        .map(|(i, l)| StreakBucket {
-            label: l.to_string(),
-            green: green_streaks[i],
-            red: red_streaks[i],
-        })
-        .collect();
-
-    let red_streak_hist = red_exact
-        .iter()
-        .enumerate()
-        .map(|(i, c)| LenCount {
-            length: i as u64 + 1,
-            count: *c,
-        })
-        .collect();
-
-    Ok(HistoryStats {
+    Ok(Prepared {
         from_game: game_number,
         to_game: classic_start,
-        total_games: total as u64,
-        green_count: green as u64,
-        red_count: (total - green) as u64,
-        instant_busts: instant as u64,
-        mean_bust: mean_centi / 100.0,
-        max_bust: max_centi as f64 / 100.0,
-        max_bust_game,
-        longest_green_streak: longest_green,
-        longest_red_streak: longest_red,
-        current_streak_len,
-        current_streak_green,
-        distribution,
-        streaks,
-        red_streak_hist,
+        total_games: game_number - classic_start + 1,
     })
 }
 
@@ -634,7 +496,12 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, bust_from_hash, compute_history])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            bust_from_hash,
+            compute_history,
+            run_query
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -674,32 +541,34 @@ mod tests {
         conn
     }
 
+    /// Run a query that returns a single integer in column `c`.
+    async fn scalar(conn: &libsql::Connection, sql: &str, params: Vec<Json>) -> i64 {
+        let rows = query_rows(conn, sql, params).await.unwrap();
+        rows[0]["c"].as_i64().unwrap()
+    }
+
     #[tokio::test]
-    async fn history_invariants() {
+    async fn locate_and_fill() {
         let conn = mem_conn().await;
-        // 10 steps to inception, offset so game_number lands 10 above classic_start.
+        // 10 steps to inception, offset so game_number lands 5 above classic_start.
         let inception = synthetic_inception(START, 10);
         let classic_start = 1_000u64;
         let offset = classic_start - 5; // game_number = classic_start + 5
-        let s = run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
+        let p = run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
             .await
             .unwrap();
 
-        assert_eq!(s.from_game, classic_start + 5);
-        assert_eq!(s.to_game, classic_start);
-        assert_eq!(s.total_games, 6);
-        assert_eq!(s.green_count + s.red_count, s.total_games);
-        let dist: u64 = s.distribution.iter().map(|b| b.count).sum();
-        assert_eq!(dist, s.total_games);
-        let streak_runs: u64 = s.streaks.iter().map(|b| b.green + b.red).sum();
-        // Every game belongs to exactly one run, and runs partition the games,
-        // so total run length == total games (sanity on the gaps-and-islands SQL).
-        let red_runs: u64 = s.red_streak_hist.iter().map(|h| h.count).sum();
-        assert!(streak_runs >= 1 && red_runs <= streak_runs);
-        assert!(s.longest_green_streak <= s.total_games);
-        assert!(s.longest_red_streak <= s.total_games);
-        assert!(s.max_bust >= 1.0);
-        assert!(s.current_streak_len >= 1);
+        assert_eq!(p.from_game, classic_start + 5);
+        assert_eq!(p.to_game, classic_start);
+        assert_eq!(p.total_games, 6);
+
+        // The cache holds exactly the classic range [classic_start, from_game].
+        let n = scalar(&conn, "SELECT COUNT(*) AS c FROM games", vec![]).await;
+        assert_eq!(n as u64, p.total_games);
+        let lo = scalar(&conn, "SELECT MIN(game_id) AS c FROM games", vec![]).await;
+        let hi = scalar(&conn, "SELECT MAX(game_id) AS c FROM games", vec![]).await;
+        assert_eq!(lo as u64, classic_start);
+        assert_eq!(hi as u64, classic_start + 5);
     }
 
     #[tokio::test]
@@ -723,7 +592,7 @@ mod tests {
 
     // Walking forward (sha256) generates OLDER games, so sha256^k(START) is the
     // game k positions below START on the chain. Entering an older game first,
-    // then START, exercises the incremental locate+fill path; the final stats
+    // then START, exercises the incremental locate+fill path; the cached data
     // must match a single cold computation of the same range.
     #[tokio::test]
     async fn incremental_matches_full() {
@@ -731,11 +600,17 @@ mod tests {
         let classic_start = 1_000u64;
         let offset = classic_start - 5; // game_number(START) = classic_start + 5
 
+        let count_sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
+        let green_sql = "SELECT COALESCE(SUM(bust_centi >= 200),0) AS c FROM games WHERE game_id <= ?1";
+
         // Cold, single-shot computation of the full range.
         let cold = mem_conn().await;
         let full = run_history(&cold, START, &inception, offset, classic_start, 100, &|_, _, _| {})
             .await
             .unwrap();
+        let g = Json::from(full.from_game);
+        let full_count = scalar(&cold, count_sql, vec![g.clone()]).await;
+        let full_green = scalar(&cold, green_sql, vec![g.clone()]).await;
 
         // Incremental: first an older game (4 steps below START), then START.
         let older = synthetic_inception(START, 4); // game_number = classic_start + 1
@@ -744,21 +619,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.from_game, classic_start + 1);
-
         let second = run_history(&inc, START, &inception, offset, classic_start, 100, &|_, _, _| {})
             .await
             .unwrap();
 
-        // The incremental run reached the same game via the cached anchor and
-        // produced identical aggregates.
         assert_eq!(second.from_game, full.from_game);
         assert_eq!(second.total_games, full.total_games);
-        assert_eq!(second.green_count, full.green_count);
-        assert_eq!(second.red_count, full.red_count);
-        assert_eq!(second.longest_green_streak, full.longest_green_streak);
-        assert_eq!(second.longest_red_streak, full.longest_red_streak);
-        assert_eq!(second.max_bust_game, full.max_bust_game);
-        assert!((second.mean_bust - full.mean_bust).abs() < 1e-9);
+        assert_eq!(scalar(&inc, count_sql, vec![g.clone()]).await, full_count);
+        assert_eq!(scalar(&inc, green_sql, vec![g]).await, full_green);
     }
 
     #[tokio::test]
@@ -776,5 +644,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.from_game, classic_start + 5);
+    }
+
+    #[tokio::test]
+    async fn run_query_binds_params_and_types() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+        run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
+            .await
+            .unwrap();
+
+        // A representative dashboard-style query with a bound bound and mixed
+        // column types (int + real + text).
+        let rows = query_rows(
+            &conn,
+            "SELECT COUNT(*) AS games, AVG(bust_centi)/100.0 AS mean, MAX(hash) AS h
+             FROM games WHERE game_id <= ?1",
+            vec![Json::from(classic_start + 5)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["games"].as_i64().unwrap(), 6);
+        assert!(rows[0]["mean"].as_f64().unwrap() >= 1.0);
+        assert!(rows[0]["h"].is_string());
+    }
+
+    #[tokio::test]
+    async fn run_query_rejects_writes_when_query_only() {
+        let conn = mem_conn().await;
+        conn.execute("PRAGMA query_only = ON", ()).await.unwrap();
+        // A mutation must fail on a read-only connection.
+        let err = query_rows(
+            &conn,
+            "INSERT INTO games(game_id,hash,bust_centi) VALUES (1,'deadbeef',100)",
+            vec![],
+        )
+        .await;
+        assert!(err.is_err());
     }
 }

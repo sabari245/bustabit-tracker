@@ -14,15 +14,23 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Navbar } from "@/components/navbar";
 import { ThemeProvider } from "@/components/theme-provider";
-import { Dashboard, type HistoryStats } from "@/components/dashboard";
+import { DashboardRenderer } from "@/components/dashboard-renderer";
+import { DASHBOARD } from "@/lib/dashboard-spec";
 import {
   ProgressDialog,
   type HistoryProgress,
 } from "@/components/progress-dialog";
 
+/** Range bounds returned once the cache is populated for a lookup. */
+type Prepared = {
+  from_game: number;
+  to_game: number;
+  total_games: number;
+};
+
 function App() {
   const [hash, setHash] = useState("");
-  const [stats, setStats] = useState<HistoryStats | null>(null);
+  const [game, setGame] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<HistoryProgress>({
@@ -33,7 +41,7 @@ function App() {
 
   async function computeHistory() {
     setError(null);
-    setStats(null);
+    setGame(null);
     setProgress({ phase: "locating", current: 0, total: 0 });
     setLoading(true);
     const unlisten = await listen<HistoryProgress>(
@@ -41,10 +49,10 @@ function App() {
       (e) => setProgress(e.payload),
     );
     try {
-      const result = await invoke<HistoryStats>("compute_history", {
+      const result = await invoke<Prepared>("compute_history", {
         gameHash: hash,
       });
-      setStats(result);
+      setGame(result.from_game);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -98,7 +106,7 @@ function App() {
             </CardContent>
           </Card>
 
-          {stats && <Dashboard stats={stats} />}
+          {game != null && <DashboardRenderer spec={DASHBOARD} game={game} />}
         </main>
       </div>
     </ThemeProvider>
