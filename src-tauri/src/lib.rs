@@ -281,8 +281,10 @@ async fn query_rows(
 }
 
 /// Create the cache table (idempotent) and set pragmas tuned for bulk inserts.
-/// The UNIQUE index on `hash` is what makes "is this hash already cached?"
-/// lookups O(log n) instead of a chain walk.
+/// The UNIQUE index on `hash` makes "is this hash already cached?" lookups
+/// O(log n) instead of a chain walk; the `(is_green, game_id)` index lets the
+/// streak window queries (PARTITION BY is_green ORDER BY game_id) skip sorting
+/// millions of rows. `is_green` is the precomputed 2.00× green/red flag.
 async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\n\
@@ -290,12 +292,47 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS games (\n\
              game_id    INTEGER PRIMARY KEY,\n\
              hash       TEXT    NOT NULL UNIQUE,\n\
-             bust_centi INTEGER NOT NULL\n\
+             bust_centi INTEGER NOT NULL,\n\
+             is_green   INTEGER NOT NULL\n\
          );",
     )
     .await
+    .map_err(|e| format!("schema init failed: {e}"))?;
+
+    // Migrate caches created before the is_green column existed: add it and
+    // backfill from bust_centi (the green boundary is 2.00× == 200 centi).
+    if !column_exists(conn, "games", "is_green").await? {
+        conn.execute("ALTER TABLE games ADD COLUMN is_green INTEGER NOT NULL DEFAULT 0", ())
+            .await
+            .map_err(|e| format!("schema migration failed: {e}"))?;
+        conn.execute("UPDATE games SET is_green = (bust_centi >= 200)", ())
+            .await
+            .map_err(|e| format!("schema migration failed: {e}"))?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_games_green_game ON games(is_green, game_id)",
+        (),
+    )
+    .await
     .map(|_| ())
-    .map_err(|e| format!("schema init failed: {e}"))
+    .map_err(|e| format!("index init failed: {e}"))
+}
+
+/// Whether `table` has a column named `col` (via PRAGMA table_info).
+async fn column_exists(conn: &libsql::Connection, table: &str, col: &str) -> Result<bool, String> {
+    // `table` is an internal constant, not user input — no injection surface.
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(|e| format!("schema check failed: {e}"))?;
+    while let Some(r) = rows.next().await.map_err(|e| format!("schema check failed: {e}"))? {
+        let name: String = r.get(1).map_err(|e| format!("schema check failed: {e}"))?;
+        if name == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The game number for a hash we've already cached, if any.
@@ -393,13 +430,14 @@ async fn fill_range(
 
     loop {
         let centi = bust_centi_of_bytes(&cur);
+        let green = (centi >= 200) as i64;
         if in_batch == 0 {
-            buf.push_str("INSERT INTO games(game_id,hash,bust_centi) VALUES ");
+            buf.push_str("INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES ");
         } else {
             buf.push(',');
         }
-        // game_id and centi are integers; hash is validated hex — no injection risk.
-        let _ = write!(buf, "({},'{}',{})", gid, hex::encode(&cur), centi);
+        // game_id, centi and green are integers; hash is validated hex — no injection risk.
+        let _ = write!(buf, "({},'{}',{},{})", gid, hex::encode(&cur), centi, green);
         in_batch += 1;
 
         if in_batch >= CHUNK_ROWS {
@@ -679,7 +717,7 @@ mod tests {
         // A mutation must fail on a read-only connection.
         let err = query_rows(
             &conn,
-            "INSERT INTO games(game_id,hash,bust_centi) VALUES (1,'deadbeef',100)",
+            "INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES (1,'deadbeef',100,0)",
             vec![],
         )
         .await;

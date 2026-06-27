@@ -49,17 +49,14 @@ export type TabsWidgetSpec = {
 export type Widget = StatWidgetSpec | ChartWidgetSpec | TabsWidgetSpec;
 export type DashboardSpec = { rows: { widgets: Widget[] }[] };
 
-// Shared CTE: classify each game as green/red and collapse consecutive same-
-// colour games into runs via gaps-and-islands. Reused by every streak query.
+// Shared CTE: collapse consecutive same-colour games into runs via gaps-and-
+// islands. Reused by every streak query. Reads the precomputed `is_green` flag
+// directly so the (is_green, game_id) index can satisfy the window ordering.
 const RUNS = `
-  WITH g AS (
-    SELECT game_id, CASE WHEN bust_centi >= 200 THEN 1 ELSE 0 END AS green
+  WITH grp AS (
+    SELECT game_id, is_green AS green,
+           game_id - ROW_NUMBER() OVER (PARTITION BY is_green ORDER BY game_id) AS island
     FROM games WHERE game_id <= ?1
-  ),
-  grp AS (
-    SELECT game_id, green,
-           game_id - ROW_NUMBER() OVER (PARTITION BY green ORDER BY game_id) AS island
-    FROM g
   ),
   runs AS (
     SELECT green, COUNT(*) AS len, MAX(game_id) AS hi
@@ -100,7 +97,7 @@ export const DASHBOARD: DashboardSpec = {
           title: "Green rate",
           format: "pct",
           hint: "≥2× · {g} games",
-          sql: "SELECT 100.0 * SUM(bust_centi >= 200) / COUNT(*) AS value, SUM(bust_centi >= 200) AS g FROM games WHERE game_id <= ?1",
+          sql: "SELECT 100.0 * SUM(is_green) / COUNT(*) AS value, SUM(is_green) AS g FROM games WHERE game_id <= ?1",
         },
         {
           kind: "stat",
@@ -151,14 +148,22 @@ export const DASHBOARD: DashboardSpec = {
           description: "How often each multiplier range hits",
           x: "label",
           series: [{ key: "count", label: "Games", color: "var(--chart-1)" }],
-          sql: `WITH buckets(label, ord, lo, hi) AS (
-                  VALUES ('<2×',0,0,200),('2–5×',1,200,500),('5–10×',2,500,1000),
-                         ('10–100×',3,1000,10000),('≥100×',4,10000,1000000000)
+          sql: `WITH d AS (
+                  SELECT
+                    SUM(bust_centi < 200) AS b0,
+                    SUM(bust_centi >= 200 AND bust_centi < 500) AS b1,
+                    SUM(bust_centi >= 500 AND bust_centi < 1000) AS b2,
+                    SUM(bust_centi >= 1000 AND bust_centi < 10000) AS b3,
+                    SUM(bust_centi >= 10000) AS b4
+                  FROM games WHERE game_id <= ?1
                 )
-                SELECT b.label AS label,
-                  (SELECT COUNT(*) FROM games
-                   WHERE game_id <= ?1 AND bust_centi >= b.lo AND bust_centi < b.hi) AS count
-                FROM buckets b ORDER BY b.ord`,
+                SELECT label, count FROM (
+                  SELECT '<2×' AS label, 0 AS ord, b0 AS count FROM d
+                  UNION ALL SELECT '2–5×', 1, b1 FROM d
+                  UNION ALL SELECT '5–10×', 2, b2 FROM d
+                  UNION ALL SELECT '10–100×', 3, b3 FROM d
+                  UNION ALL SELECT '≥100×', 4, b4 FROM d
+                ) ORDER BY ord`,
         },
         {
           kind: "chart",
