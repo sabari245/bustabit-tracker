@@ -1,16 +1,4 @@
-import { useEffect, useState, type ReactElement } from "react";
-import {
-  Area,
-  AreaChart,
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Line,
-  LineChart,
-  ReferenceLine,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { useEffect, useState } from "react";
 
 import {
   Card,
@@ -19,15 +7,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  ChartContainer,
-  ChartLegend,
-  ChartLegendContent,
-  ChartTooltip,
-  ChartTooltipContent,
-  type ChartConfig,
-} from "@/components/ui/chart";
 import { Skeleton } from "@/components/ui/skeleton";
+import { UplotChart } from "@/components/widgets/uplot-chart";
 import { runQuery, type Row } from "@/lib/query";
 import {
   CHART_PALETTE,
@@ -58,86 +39,6 @@ function resolveAxes(
     color: CHART_PALETTE[i % CHART_PALETTE.length],
   }));
   return { x, series };
-}
-
-function renderChart(
-  widget: ChartWidgetSpec,
-  data: Row[],
-  x: string,
-  series: Series[],
-): ReactElement {
-  const showLegend = series.length > 1;
-  const yProps = {
-    tickLine: false,
-    axisLine: false,
-    width: 48,
-    ...(widget.yUnit ? { unit: widget.yUnit } : {}),
-    ...(widget.yDomain ? { domain: widget.yDomain } : {}),
-  };
-
-  if (widget.type === "bar") {
-    return (
-      <BarChart data={data}>
-        <CartesianGrid vertical={false} />
-        <XAxis dataKey={x} tickLine={false} axisLine={false} />
-        <YAxis {...yProps} />
-        <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
-        {showLegend && <ChartLegend content={<ChartLegendContent />} />}
-        {series.map((s) => (
-          <Bar key={s.key} dataKey={s.key} fill={`var(--color-${s.key})`} radius={4} />
-        ))}
-      </BarChart>
-    );
-  }
-
-  if (widget.type === "area") {
-    return (
-      <AreaChart data={data}>
-        <CartesianGrid vertical={false} />
-        <XAxis dataKey={x} tickLine={false} axisLine={false} />
-        <YAxis {...yProps} />
-        <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
-        {showLegend && <ChartLegend content={<ChartLegendContent />} />}
-        {series.map((s) => (
-          <Area
-            key={s.key}
-            dataKey={s.key}
-            type="monotone"
-            stroke={`var(--color-${s.key})`}
-            fill={`var(--color-${s.key})`}
-            fillOpacity={0.2}
-          />
-        ))}
-      </AreaChart>
-    );
-  }
-
-  return (
-    <LineChart data={data}>
-      <CartesianGrid vertical={false} />
-      <XAxis dataKey={x} tickLine={false} axisLine={false} />
-      <YAxis {...yProps} />
-      <ChartTooltip content={<ChartTooltipContent labelKey={x} />} />
-      {showLegend && <ChartLegend content={<ChartLegendContent />} />}
-      {widget.refLine != null && (
-        <ReferenceLine
-          y={widget.refLine}
-          strokeDasharray="4 4"
-          stroke="var(--muted-foreground)"
-        />
-      )}
-      {series.map((s) => (
-        <Line
-          key={s.key}
-          dataKey={s.key}
-          type="monotone"
-          stroke={`var(--color-${s.key})`}
-          dot={false}
-          strokeWidth={2}
-        />
-      ))}
-    </LineChart>
-  );
 }
 
 export function ChartWidget({
@@ -172,9 +73,6 @@ export function ChartWidget({
   }, [widget.sql, game, precomputed]);
 
   const { x, series } = resolveAxes(widget, data ?? []);
-  const config: ChartConfig = Object.fromEntries(
-    series.map((s) => [s.key, { label: s.label, color: s.color }]),
-  );
 
   const body = error ? (
     <p className="text-sm text-destructive">{error}</p>
@@ -183,9 +81,7 @@ export function ChartWidget({
   ) : data.length === 0 || series.length === 0 ? (
     <p className="text-sm text-muted-foreground">No data to plot.</p>
   ) : (
-    <ChartContainer config={config} className="h-[300px] w-full">
-      {renderChart(widget, data, x, series)}
-    </ChartContainer>
+    <UplotChart widget={widget} data={data} x={x} series={series} />
   );
 
   if (embedded) {
