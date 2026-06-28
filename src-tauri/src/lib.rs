@@ -203,8 +203,11 @@ async fn compute_history(
 /// schema-driven dashboard: every card and chart is just a SELECT in the JSON
 /// spec, bound with the entered game number.
 ///
-/// `PRAGMA query_only` makes the connection reject any mutation at the engine
-/// level, so even a malformed/hostile query string can't write to the cache.
+/// Results are served from (and stored in) `query_cache`, so re-rendering a chart
+/// for an already-analysed game skips the computation entirely. On a miss the
+/// *user* SQL runs under `PRAGMA query_only`, which makes the connection reject any
+/// mutation at the engine level so even a malformed/hostile query can't write to
+/// the cache; the guard is lifted only to persist the freshly computed result.
 #[tauri::command]
 async fn run_query(
     app: tauri::AppHandle,
@@ -223,10 +226,25 @@ async fn run_query(
                 .await
                 .map_err(|e| format!("couldn't open cache db: {e}"))?;
             let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+            ensure_cache_table(&conn).await?;
+
+            let key = query_cache_key(&sql, &params);
+            if let Some(hit) = cache_get(&conn, &key).await? {
+                return Ok(hit);
+            }
+
+            // Run the untrusted user SQL sandboxed (read-only), then drop the guard
+            // to persist the result so the next render of this chart is a cache hit.
             conn.execute("PRAGMA query_only = ON", ())
                 .await
                 .map_err(|e| format!("couldn't set read-only mode: {e}"))?;
-            query_rows(&conn, &sql, params).await
+            let computed = query_rows(&conn, &sql, params).await;
+            conn.execute("PRAGMA query_only = OFF", ())
+                .await
+                .map_err(|e| format!("couldn't clear read-only mode: {e}"))?;
+            let rows = computed?;
+            cache_put(&conn, &key, &rows).await?;
+            Ok(rows)
         })
     })
     .await
@@ -337,6 +355,74 @@ async fn query_rows(
     Ok(out)
 }
 
+/// The cache identity for a query: `sha256(sql + NUL + params-json)`, hex-encoded.
+/// Including the bound params means a different game number (or any other bound
+/// value) maps to a distinct entry, and editing a chart's SQL never collides with
+/// the old result. See `ensure_cache_table` for why this key never goes stale.
+fn query_cache_key(sql: &str, params: &[Json]) -> String {
+    let mut h = Sha256::new();
+    h.update(sql.as_bytes());
+    h.update([0u8]);
+    h.update(serde_json::to_vec(params).unwrap_or_default());
+    hex::encode(h.finalize())
+}
+
+/// Look up a previously cached result for `key`, deserializing the stored JSON.
+async fn cache_get(
+    conn: &libsql::Connection,
+    key: &str,
+) -> Result<Option<Vec<serde_json::Map<String, Json>>>, String> {
+    let mut rows = conn
+        .query("SELECT result FROM query_cache WHERE cache_key = ?1", libsql::params![key])
+        .await
+        .map_err(|e| format!("cache read failed: {e}"))?;
+    match rows.next().await.map_err(|e| format!("cache read failed: {e}"))? {
+        Some(r) => {
+            let s: String = r.get(0).map_err(|e| format!("cache read failed: {e}"))?;
+            let parsed = serde_json::from_str(&s)
+                .map_err(|e| format!("corrupt cache entry: {e}"))?;
+            Ok(Some(parsed))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Persist a query result under `key` (upsert, so a recompute overwrites cleanly).
+async fn cache_put(
+    conn: &libsql::Connection,
+    key: &str,
+    rows: &[serde_json::Map<String, Json>],
+) -> Result<(), String> {
+    let s = serde_json::to_string(rows).map_err(|e| format!("cache encode failed: {e}"))?;
+    conn.execute(
+        "INSERT INTO query_cache(cache_key, result) VALUES (?1, ?2)\n\
+         ON CONFLICT(cache_key) DO UPDATE SET result = excluded.result",
+        libsql::params![key, s],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("cache write failed: {e}"))?;
+    Ok(())
+}
+
+/// Run a query through the result cache: return the stored rows on a hit, else
+/// compute, persist, and return them. The connection must be writable (the
+/// precompute path is; `run_query` guards the *user* SQL with `query_only` but
+/// writes the cache with the guard off).
+async fn cached_query_rows(
+    conn: &libsql::Connection,
+    sql: &str,
+    params: Vec<Json>,
+) -> Result<Vec<serde_json::Map<String, Json>>, String> {
+    let key = query_cache_key(sql, &params);
+    if let Some(hit) = cache_get(conn, &key).await? {
+        return Ok(hit);
+    }
+    let rows = query_rows(conn, sql, params).await?;
+    cache_put(conn, &key, &rows).await?;
+    Ok(rows)
+}
+
 /// Create the cache table (idempotent) and set pragmas tuned for bulk inserts.
 /// The UNIQUE index on `hash` makes "is this hash already cached?" lookups
 /// O(log n) instead of a chain walk; the `(is_green, game_id)` index lets the
@@ -376,8 +462,31 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
         (),
     )
     .await
+    .map_err(|e| format!("index init failed: {e}"))?;
+
+    ensure_cache_table(conn).await
+}
+
+/// Create the chart-result cache table (idempotent). Kept separate from the full
+/// `ensure_schema` so the read-only `run_query` path can guarantee the table
+/// exists without re-running the games-table migration on every call.
+///
+/// A dashboard query's result is a pure function of its (SQL, bound params): the
+/// `games` table is append-only and every game ≤ N is immutable, and every query
+/// filters `game_id <= ?1`. So a row keyed by `sha256(sql + params)` stays correct
+/// forever — no invalidation needed. A newer hash yields a higher game number
+/// (different params → new key); an edited chart yields different SQL (new key).
+async fn ensure_cache_table(conn: &libsql::Connection) -> Result<(), String> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS query_cache (\n\
+             cache_key TEXT PRIMARY KEY,\n\
+             result    TEXT NOT NULL\n\
+         )",
+        (),
+    )
+    .await
     .map(|_| ())
-    .map_err(|e| format!("index init failed: {e}"))
+    .map_err(|e| format!("cache table init failed: {e}"))
 }
 
 /// Whether `table` has a column named `col` (via PRAGMA table_info).
@@ -583,11 +692,13 @@ async fn run_history(
     }
 
     // Per-query failures are skipped: the widget falls back to its on-demand `runQuery`.
+    // Each result is served from `query_cache` when present, so repeat lookups of an
+    // already-analysed game return instantly instead of re-scanning the games table.
     let total_queries = queries.len() as u64;
     let mut results: BTreeMap<String, Vec<serde_json::Map<String, Json>>> = BTreeMap::new();
     for (i, q) in queries.iter().enumerate() {
         report("aggregating", i as u64, total_queries);
-        if let Ok(rows) = query_rows(conn, &q.sql, vec![Json::from(game_number)]).await {
+        if let Ok(rows) = cached_query_rows(conn, &q.sql, vec![Json::from(game_number)]).await {
             results.insert(q.id.clone(), rows);
         }
     }
@@ -968,6 +1079,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0]["spec"].as_str().unwrap(), "{\"rows\":[{\"widgets\":[]}]}");
+    }
+
+    #[tokio::test]
+    async fn cached_query_returns_stored_result_after_data_changes() {
+        let conn = mem_conn().await;
+        conn.execute(
+            "INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES (1,'aa',100,0)",
+            (),
+        )
+        .await
+        .unwrap();
+        let sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
+        let params = vec![Json::from(10)];
+
+        // First call computes (count = 1) and caches it.
+        let first = cached_query_rows(&conn, sql, params.clone()).await.unwrap();
+        assert_eq!(first[0]["c"].as_i64().unwrap(), 1);
+
+        // Underlying data changes: a fresh, uncached query now sees 2 rows...
+        conn.execute(
+            "INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES (2,'bb',100,0)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(scalar(&conn, sql, params.clone()).await, 2);
+
+        // ...but the cached call still returns the original result, proving the
+        // hit was served from query_cache rather than recomputed. (In production
+        // the games ≤ N never change, so this can only ever be the right answer.)
+        let second = cached_query_rows(&conn, sql, params).await.unwrap();
+        assert_eq!(second[0]["c"].as_i64().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cached_query_keys_on_params() {
+        let conn = mem_conn().await;
+        for (g, h) in [(1, "aa"), (2, "bb")] {
+            conn.execute(
+                &format!("INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES ({g},'{h}',100,0)"),
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
+        // Same SQL, different bound game number → independent cache entries.
+        let a = cached_query_rows(&conn, sql, vec![Json::from(1)]).await.unwrap();
+        let b = cached_query_rows(&conn, sql, vec![Json::from(2)]).await.unwrap();
+        assert_eq!(a[0]["c"].as_i64().unwrap(), 1);
+        assert_eq!(b[0]["c"].as_i64().unwrap(), 2);
+        assert_ne!(
+            query_cache_key(sql, &[Json::from(1)]),
+            query_cache_key(sql, &[Json::from(2)])
+        );
+    }
+
+    #[tokio::test]
+    async fn precompute_populates_query_cache() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+        let queries = vec![PrecomputeQuery {
+            id: "count".to_string(),
+            sql: "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1".to_string(),
+        }];
+
+        run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &queries,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        // The precompute pass wrote the result into the cache for reuse next run.
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM query_cache", vec![]).await, 1);
     }
 
     #[tokio::test]
