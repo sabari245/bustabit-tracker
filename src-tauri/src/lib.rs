@@ -233,17 +233,8 @@ async fn run_query(
     .map_err(|e| format!("query failed to run: {e}"))?
 }
 
-/// A user-defined dashboard view: a name and a JSON dashboard spec (the same
-/// shape the built-in dashboard uses).
-#[derive(Serialize)]
-struct SavedView {
-    id: i64,
-    name: String,
-    spec: String,
-}
-
-/// Open the cache db and ensure the schema exists. Used by the lightweight view
-/// CRUD commands (no heavy CPU, so they run directly on the async runtime).
+/// Open the cache db and ensure the schema exists. Used by the lightweight
+/// layout commands (no heavy CPU, so they run directly on the async runtime).
 async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, String> {
     let path = db_path(app)?;
     let db = libsql::Builder::new_local(path)
@@ -255,66 +246,35 @@ async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, Stri
     Ok(conn)
 }
 
-/// List all saved custom views (the built-in dashboard is not stored here).
+/// Load the single persisted dashboard layout (a JSON spec), or `None` on first
+/// run before any layout has been saved.
 #[tauri::command]
-async fn list_views(app: tauri::AppHandle) -> Result<Vec<SavedView>, String> {
+async fn load_layout(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let conn = open_db_conn(&app).await?;
     let mut rows = conn
-        .query("SELECT id, name, spec FROM views ORDER BY id", ())
+        .query("SELECT spec FROM layout WHERE id = 1", ())
         .await
-        .map_err(|e| format!("couldn't list views: {e}"))?;
-    let mut out = Vec::new();
-    while let Some(r) = rows.next().await.map_err(|e| format!("couldn't list views: {e}"))? {
-        let map = |e: libsql::Error| format!("couldn't read view: {e}");
-        out.push(SavedView {
-            id: r.get(0).map_err(map)?,
-            name: r.get(1).map_err(map)?,
-            spec: r.get(2).map_err(map)?,
-        });
+        .map_err(|e| format!("couldn't load layout: {e}"))?;
+    match rows.next().await.map_err(|e| format!("couldn't load layout: {e}"))? {
+        Some(r) => Ok(Some(r.get(0).map_err(|e| format!("couldn't read layout: {e}"))?)),
+        None => Ok(None),
     }
-    Ok(out)
 }
 
-/// Persist a new custom view; returns its id. `spec` must be valid JSON.
+/// Save the single dashboard layout, replacing whatever was there. `spec` must
+/// be valid JSON (the full grid of rows and widgets).
 #[tauri::command]
-async fn save_view(app: tauri::AppHandle, name: String, spec: String) -> Result<i64, String> {
-    serde_json::from_str::<Json>(&spec).map_err(|e| format!("view spec isn't valid JSON: {e}"))?;
+async fn save_layout(app: tauri::AppHandle, spec: String) -> Result<(), String> {
+    serde_json::from_str::<Json>(&spec)
+        .map_err(|e| format!("layout spec isn't valid JSON: {e}"))?;
     let conn = open_db_conn(&app).await?;
     conn.execute(
-        "INSERT INTO views(name, spec) VALUES (?1, ?2)",
-        libsql::params![name, spec],
+        "INSERT INTO layout(id, spec) VALUES (1, ?1)\n\
+         ON CONFLICT(id) DO UPDATE SET spec = excluded.spec",
+        libsql::params![spec],
     )
     .await
-    .map_err(|e| format!("couldn't save view: {e}"))?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Update an existing custom view in place. `spec` must be valid JSON.
-#[tauri::command]
-async fn update_view(
-    app: tauri::AppHandle,
-    id: i64,
-    name: String,
-    spec: String,
-) -> Result<(), String> {
-    serde_json::from_str::<Json>(&spec).map_err(|e| format!("view spec isn't valid JSON: {e}"))?;
-    let conn = open_db_conn(&app).await?;
-    conn.execute(
-        "UPDATE views SET name = ?2, spec = ?3 WHERE id = ?1",
-        libsql::params![id, name, spec],
-    )
-    .await
-    .map_err(|e| format!("couldn't update view: {e}"))?;
-    Ok(())
-}
-
-/// Delete a custom view.
-#[tauri::command]
-async fn delete_view(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    let conn = open_db_conn(&app).await?;
-    conn.execute("DELETE FROM views WHERE id = ?1", libsql::params![id])
-        .await
-        .map_err(|e| format!("couldn't delete view: {e}"))?;
+    .map_err(|e| format!("couldn't save layout: {e}"))?;
     Ok(())
 }
 
@@ -392,9 +352,8 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
              bust_centi INTEGER NOT NULL,\n\
              is_green   INTEGER NOT NULL\n\
          );\n\
-         CREATE TABLE IF NOT EXISTS views (\n\
-             id   INTEGER PRIMARY KEY AUTOINCREMENT,\n\
-             name TEXT NOT NULL,\n\
+         CREATE TABLE IF NOT EXISTS layout (\n\
+             id   INTEGER PRIMARY KEY CHECK (id = 1),\n\
              spec TEXT NOT NULL\n\
          );",
     )
@@ -656,10 +615,8 @@ pub fn run() {
             bust_from_hash,
             compute_history,
             run_query,
-            list_views,
-            save_view,
-            update_view,
-            delete_view
+            load_layout,
+            save_layout
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -995,30 +952,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn views_crud() {
+    async fn layout_upserts_single_row() {
         let conn = mem_conn().await;
-        conn.execute(
-            "INSERT INTO views(name, spec) VALUES (?1, ?2)",
-            libsql::params!["My view", "{\"rows\":[]}"],
-        )
-        .await
-        .unwrap();
-        let id = conn.last_insert_rowid();
+        let upsert = "INSERT INTO layout(id, spec) VALUES (1, ?1)\n\
+                      ON CONFLICT(id) DO UPDATE SET spec = excluded.spec";
 
-        let mut rows = conn
-            .query("SELECT id, name, spec FROM views WHERE id = ?1", libsql::params![id])
+        conn.execute(upsert, libsql::params!["{\"rows\":[]}"]).await.unwrap();
+        conn.execute(upsert, libsql::params!["{\"rows\":[{\"widgets\":[]}]}"])
             .await
             .unwrap();
-        let r = rows.next().await.unwrap().unwrap();
-        assert_eq!(r.get::<String>(1).unwrap(), "My view");
 
-        conn.execute("UPDATE views SET name = ?2 WHERE id = ?1", libsql::params![id, "Renamed"])
+        // Always exactly one row; the latest spec wins.
+        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM layout", vec![]).await, 1);
+        let rows = query_rows(&conn, "SELECT spec FROM layout WHERE id = 1", vec![])
             .await
             .unwrap();
-        conn.execute("DELETE FROM views WHERE id = ?1", libsql::params![id])
-            .await
-            .unwrap();
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM views", vec![]).await, 0);
+        assert_eq!(rows[0]["spec"].as_str().unwrap(), "{\"rows\":[{\"widgets\":[]}]}");
     }
 
     #[tokio::test]

@@ -7,8 +7,13 @@
 export type Series = { key: string; label: string; color: string };
 export type WidgetSize = "stat" | "half" | "full";
 
+/** Max widgets allowed on a single dashboard row (drag-and-drop constraint). */
+export const MAX_PER_ROW = 4;
+
 export type StatWidgetSpec = {
   kind: "stat";
+  /** Stable id, used as the precompute key and the drag-and-drop item id. */
+  id?: string;
   size?: WidgetSize;
   title: string;
   sql: string;
@@ -21,6 +26,8 @@ export type StatWidgetSpec = {
 
 export type ChartWidgetSpec = {
   kind: "chart";
+  /** Stable id, used as the precompute key and the drag-and-drop item id. */
+  id?: string;
   type: "bar" | "line" | "area";
   size?: WidgetSize;
   title: string;
@@ -50,6 +57,8 @@ export type TabSpec = { value: string; label: string; chart: ChartWidgetSpec };
 
 export type TabsWidgetSpec = {
   kind: "tabs";
+  /** Stable id, used as the precompute key and the drag-and-drop item id. */
+  id?: string;
   size?: WidgetSize;
   title: string;
   description?: string;
@@ -57,7 +66,9 @@ export type TabsWidgetSpec = {
 };
 
 export type Widget = StatWidgetSpec | ChartWidgetSpec | TabsWidgetSpec;
-export type DashboardSpec = { rows: { widgets: Widget[] }[] };
+/** A row of widgets. `id` is stable so drag-and-drop animations survive reorders. */
+export type DashboardRow = { id?: string; widgets: Widget[] };
+export type DashboardSpec = { rows: DashboardRow[] };
 
 // Shared CTE: collapse consecutive same-colour games into runs via gaps-and-
 // islands. Reused by every streak query. Reads the precomputed `is_green` flag

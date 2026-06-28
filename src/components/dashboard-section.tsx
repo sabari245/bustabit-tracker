@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Plus } from "lucide-react";
 
 import {
   AlertDialog,
@@ -12,145 +12,130 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { DashboardRenderer } from "@/components/dashboard-renderer";
-import { ViewEditor } from "@/components/view-editor";
-import { DASHBOARD, type DashboardSpec } from "@/lib/dashboard-spec";
+import { DashboardGrid } from "@/components/dashboard-grid";
+import { ChartEditor } from "@/components/chart-editor";
+import { StatWidget } from "@/components/widgets/stat-widget";
+import { ChartWidget } from "@/components/widgets/chart-widget";
+import { TabsWidget } from "@/components/widgets/tabs-widget";
+import type { DashboardRow, DashboardSpec, Widget } from "@/lib/dashboard-spec";
 import type { Row } from "@/lib/query";
 import {
-  deleteView,
-  listViews,
-  parseSpec,
-  type SavedView,
-} from "@/lib/views";
-
-const BUILTIN = "builtin";
+  appendWidget,
+  findWidget,
+  removeWidget,
+  replaceWidget,
+  widgetId,
+} from "@/lib/layout";
 
 export function DashboardSection({
   game,
+  layout,
   precomputed,
+  onLayoutChange,
 }: {
   game: number;
+  layout: DashboardSpec;
   precomputed: Record<string, Row[]>;
+  onLayoutChange: (spec: DashboardSpec) => void;
 }) {
-  const [views, setViews] = useState<SavedView[]>([]);
-  const [selected, setSelected] = useState<string>(BUILTIN);
+  // Local copy of the precomputed results so editing a widget's SQL can drop its
+  // (now stale) cached row and let the widget re-query live.
+  const [pre, setPre] = useState(precomputed);
+  useEffect(() => setPre(precomputed), [precomputed]);
+
   const [editorOpen, setEditorOpen] = useState(false);
-  const [editing, setEditing] = useState<SavedView | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState(false);
-
-  const refresh = useCallback(() => listViews().then(setViews), []);
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  const activeView =
-    selected === BUILTIN ? null : views.find((v) => String(v.id) === selected) ?? null;
-
-  const spec: DashboardSpec =
-    selected === BUILTIN ? DASHBOARD : parseSpec(activeView?.spec ?? "") ?? { rows: [] };
-
-  const viewId = selected === BUILTIN ? "builtin" : `view:${activeView?.id ?? ""}`;
+  const [editing, setEditing] = useState<Widget | null>(null);
+  const [deleteId, setDeleteId] = useState<string | null>(null);
 
   function openNew() {
     setEditing(null);
     setEditorOpen(true);
   }
 
-  function openEdit() {
-    if (activeView) {
-      setEditing(activeView);
+  function openEdit(id: string) {
+    const w = findWidget(layout, id);
+    if (w) {
+      setEditing(w);
       setEditorOpen(true);
     }
   }
 
-  async function onSaved(id: number) {
-    await refresh();
-    setSelected(String(id));
+  function onSaveChart(widget: Widget) {
+    const exists = widget.id != null && findWidget(layout, widget.id) != null;
+    if (exists && widget.id) {
+      // Drop the stale precomputed row so the edited SQL runs fresh.
+      setPre((p) => {
+        const next = { ...p };
+        delete next[widgetId(widget.id!)];
+        return next;
+      });
+      onLayoutChange(replaceWidget(layout, widget));
+    } else {
+      onLayoutChange(appendWidget(layout, widget));
+    }
   }
 
-  async function doDelete() {
-    if (!activeView) return;
-    await deleteView(activeView.id);
-    setConfirmDelete(false);
-    setSelected(BUILTIN);
-    await refresh();
+  function onReorder(rows: DashboardRow[]) {
+    onLayoutChange({ rows });
   }
+
+  function doDelete() {
+    if (deleteId) onLayoutChange(removeWidget(layout, deleteId));
+    setDeleteId(null);
+  }
+
+  const renderItem = (w: Widget): ReactNode => {
+    const id = w.id ?? "";
+    if (w.kind === "stat") {
+      return <StatWidget widget={w} game={game} precomputed={pre[widgetId(id)]} />;
+    }
+    if (w.kind === "tabs") {
+      return <TabsWidget widget={w} game={game} precomputed={pre} />;
+    }
+    return <ChartWidget widget={w} game={game} precomputed={pre[widgetId(id)]} />;
+  };
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <Select value={selected} onValueChange={setSelected}>
-          <SelectTrigger className="w-[220px]">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={BUILTIN}>Built-in dashboard</SelectItem>
-            {views.map((v) => (
-              <SelectItem key={v.id} value={String(v.id)}>
-                {v.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-
-        {activeView && (
-          <>
-            <Button variant="outline" size="sm" onClick={openEdit}>
-              <Pencil />
-              Edit
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmDelete(true)}
-            >
-              <Trash2 />
-              Delete
-            </Button>
-          </>
-        )}
-
-        <Button size="sm" className="ml-auto" onClick={openNew}>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold">Dashboard</h2>
+        <Button size="sm" onClick={openNew}>
           <Plus />
-          New view
+          Add chart
         </Button>
       </div>
 
-      <DashboardRenderer
-        spec={spec}
-        game={game}
-        viewId={viewId}
-        precomputed={precomputed}
+      <DashboardGrid
+        rows={layout.rows}
+        renderItem={renderItem}
+        onChange={onReorder}
+        onEdit={openEdit}
+        onDelete={setDeleteId}
       />
 
-      <ViewEditor
+      <ChartEditor
         open={editorOpen}
         onOpenChange={setEditorOpen}
         game={game}
         editing={editing}
-        onSaved={onSaved}
+        onSave={onSaveChart}
       />
 
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+      <AlertDialog
+        open={deleteId != null}
+        onOpenChange={(o) => !o && setDeleteId(null)}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete this view?</AlertDialogTitle>
+            <AlertDialogTitle>Remove this chart?</AlertDialogTitle>
             <AlertDialogDescription>
-              “{activeView?.name}” will be permanently removed. The cached game
-              data is not affected.
+              It will be removed from your dashboard layout. The cached game data
+              is not affected.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={doDelete}>Delete</AlertDialogAction>
+            <AlertDialogAction onClick={doDelete}>Remove</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

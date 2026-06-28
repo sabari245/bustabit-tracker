@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2 } from "lucide-react";
@@ -19,8 +19,13 @@ import {
   ProgressDialog,
   type HistoryProgress,
 } from "@/components/progress-dialog";
-import { DASHBOARD } from "@/lib/dashboard-spec";
-import { extractQueries, listViews, parseSpec, type PrecomputeQuery } from "@/lib/views";
+import type { DashboardSpec } from "@/lib/dashboard-spec";
+import {
+  extractQueries,
+  loadLayout,
+  saveLayout,
+  seedLayout,
+} from "@/lib/layout";
 import type { Row } from "@/lib/query";
 
 /** Range bounds + pre-computed dashboard query results returned by `compute_history`. */
@@ -36,13 +41,34 @@ function App() {
   const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [layout, setLayout] = useState<DashboardSpec | null>(null);
   const [progress, setProgress] = useState<HistoryProgress>({
     phase: "locating",
     current: 0,
     total: 0,
   });
 
+  // Load the persisted dashboard layout once; seed it from the built-in
+  // dashboard (and persist that seed) on first run.
+  useEffect(() => {
+    loadLayout().then((stored) => {
+      if (stored) {
+        setLayout(stored);
+      } else {
+        const seeded = seedLayout();
+        setLayout(seeded);
+        saveLayout(seeded);
+      }
+    });
+  }, []);
+
+  function updateLayout(spec: DashboardSpec) {
+    setLayout(spec);
+    saveLayout(spec);
+  }
+
   async function computeHistory() {
+    if (!layout) return;
     setError(null);
     setPrepared(null);
     setProgress({ phase: "locating", current: 0, total: 0 });
@@ -52,17 +78,9 @@ function App() {
       (e) => setProgress(e.payload),
     );
     try {
-      const savedViews = await listViews();
-      const queries: PrecomputeQuery[] = [
-        ...extractQueries("builtin", DASHBOARD),
-        ...savedViews.flatMap((v) => {
-          const spec = parseSpec(v.spec);
-          return spec ? extractQueries(`view:${v.id}`, spec) : [];
-        }),
-      ];
       const result = await invoke<Prepared>("compute_history", {
         gameHash: hash,
-        queries,
+        queries: extractQueries(layout),
       });
       setPrepared(result);
     } catch (e) {
@@ -73,7 +91,7 @@ function App() {
     }
   }
 
-  const canSubmit = hash.trim().length > 0;
+  const canSubmit = hash.trim().length > 0 && layout != null;
 
   return (
     <ThemeProvider defaultTheme="system" storageKey="vite-ui-theme">
@@ -118,10 +136,12 @@ function App() {
             </CardContent>
           </Card>
 
-          {prepared != null && (
+          {prepared != null && layout != null && (
             <DashboardSection
               game={prepared.from_game}
+              layout={layout}
               precomputed={prepared.results}
+              onLayoutChange={updateLayout}
             />
           )}
         </main>

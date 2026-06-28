@@ -9,21 +9,15 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ChartWidget } from "./chart-widget";
 import type { TabsWidgetSpec } from "@/lib/dashboard-spec";
 import type { Row } from "@/lib/query";
-import { widgetId } from "@/lib/views";
+import { widgetId } from "@/lib/layout";
 
 export function TabsWidget({
   widget,
   game,
-  viewId,
-  rowIdx,
-  widgetIdx,
   precomputed,
 }: {
   widget: TabsWidgetSpec;
   game: number;
-  viewId: string;
-  rowIdx: number;
-  widgetIdx: number;
   precomputed: Record<string, Row[]>;
 }) {
   return (
@@ -49,7 +43,7 @@ export function TabsWidget({
                 widget={t.chart}
                 game={game}
                 embedded
-                precomputed={precomputed[widgetId(viewId, rowIdx, widgetIdx, t.value)]}
+                precomputed={precomputed[widgetId(widget.id ?? "", t.value)]}
               />
             </TabsContent>
           ))}
