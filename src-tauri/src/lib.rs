@@ -226,11 +226,22 @@ async fn run_query(
                 .await
                 .map_err(|e| format!("couldn't open cache db: {e}"))?;
             let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
-            ensure_cache_table(&conn).await?;
+            // Wait (up to 5s) for a competing writer's lock to clear instead of
+            // failing instantly with "database is locked" when adding a chart races
+            // a layout save or a sibling widget's cache write.
+            conn.execute("PRAGMA busy_timeout = 5000", ())
+                .await
+                .map_err(|e| format!("couldn't set busy timeout: {e}"))?;
 
+            // The result cache is a pure optimization: if any cache step can't run
+            // (table init, lookup, or write), fall back to just computing the query
+            // so a freshly added chart still renders rather than erroring out.
             let key = query_cache_key(&sql, &params);
-            if let Some(hit) = cache_get(&conn, &key).await? {
-                return Ok(hit);
+            let cacheable = ensure_cache_table(&conn).await.is_ok();
+            if cacheable {
+                if let Ok(Some(hit)) = cache_get(&conn, &key).await {
+                    return Ok(hit);
+                }
             }
 
             // Run the untrusted user SQL sandboxed (read-only), then drop the guard
@@ -243,7 +254,9 @@ async fn run_query(
                 .await
                 .map_err(|e| format!("couldn't clear read-only mode: {e}"))?;
             let rows = computed?;
-            cache_put(&conn, &key, &rows).await?;
+            if cacheable {
+                let _ = cache_put(&conn, &key, &rows).await;
+            }
             Ok(rows)
         })
     })
@@ -432,6 +445,7 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\n\
          PRAGMA synchronous=NORMAL;\n\
+         PRAGMA busy_timeout=5000;\n\
          CREATE TABLE IF NOT EXISTS games (\n\
              game_id    INTEGER PRIMARY KEY,\n\
              hash       TEXT    NOT NULL UNIQUE,\n\
