@@ -19,17 +19,21 @@ import {
   ProgressDialog,
   type HistoryProgress,
 } from "@/components/progress-dialog";
+import { DASHBOARD } from "@/lib/dashboard-spec";
+import { extractQueries, listViews, parseSpec, type PrecomputeQuery } from "@/lib/views";
+import type { Row } from "@/lib/query";
 
-/** Range bounds returned once the cache is populated for a lookup. */
+/** Range bounds + pre-computed dashboard query results returned by `compute_history`. */
 type Prepared = {
   from_game: number;
   to_game: number;
   total_games: number;
+  results: Record<string, Row[]>;
 };
 
 function App() {
   const [hash, setHash] = useState("");
-  const [game, setGame] = useState<number | null>(null);
+  const [prepared, setPrepared] = useState<Prepared | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<HistoryProgress>({
@@ -40,7 +44,7 @@ function App() {
 
   async function computeHistory() {
     setError(null);
-    setGame(null);
+    setPrepared(null);
     setProgress({ phase: "locating", current: 0, total: 0 });
     setLoading(true);
     const unlisten = await listen<HistoryProgress>(
@@ -48,10 +52,19 @@ function App() {
       (e) => setProgress(e.payload),
     );
     try {
+      const savedViews = await listViews();
+      const queries: PrecomputeQuery[] = [
+        ...extractQueries("builtin", DASHBOARD),
+        ...savedViews.flatMap((v) => {
+          const spec = parseSpec(v.spec);
+          return spec ? extractQueries(`view:${v.id}`, spec) : [];
+        }),
+      ];
       const result = await invoke<Prepared>("compute_history", {
         gameHash: hash,
+        queries,
       });
-      setGame(result.from_game);
+      setPrepared(result);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -105,7 +118,12 @@ function App() {
             </CardContent>
           </Card>
 
-          {game != null && <DashboardSection game={game} />}
+          {prepared != null && (
+            <DashboardSection
+              game={prepared.from_game}
+              precomputed={prepared.results}
+            />
+          )}
         </main>
       </div>
     </ThemeProvider>

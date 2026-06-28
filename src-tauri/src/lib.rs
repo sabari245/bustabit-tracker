@@ -1,8 +1,9 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tauri::{Emitter, Manager};
 
@@ -112,14 +113,20 @@ struct Progress {
     total: u64,
 }
 
-/// Result of preparing a history lookup: the cache is now populated for the whole
-/// classic range up to `from_game`. The dashboard turns this into the upper bound
-/// it binds into every widget's SQL query.
+/// A widget query the frontend wants pre-computed alongside the history fill.
+#[derive(Deserialize)]
+struct PrecomputeQuery {
+    id: String,
+    sql: String,
+}
+
+/// Range bounds + pre-computed dashboard query results returned by `compute_history`.
 #[derive(Serialize)]
 struct Prepared {
     from_game: u64,
     to_game: u64,
     total_games: u64,
+    results: BTreeMap<String, Vec<serde_json::Map<String, Json>>>,
 }
 
 /// Resolve (and create) the on-disk cache path: `<app data dir>/history.db`.
@@ -141,7 +148,11 @@ fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// background thread (with its own single-threaded Tokio runtime), so the window
 /// stays responsive (no Windows "Not Responding") during a cold computation.
 #[tauri::command]
-async fn compute_history(app: tauri::AppHandle, game_hash: String) -> Result<Prepared, String> {
+async fn compute_history(
+    app: tauri::AppHandle,
+    game_hash: String,
+    queries: Vec<PrecomputeQuery>,
+) -> Result<Prepared, String> {
     let db_path = db_path(&app)?;
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -177,6 +188,7 @@ async fn compute_history(app: tauri::AppHandle, game_hash: String) -> Result<Pre
                 CHAIN_OFFSET,
                 CLASSIC_START,
                 MAX_WALK,
+                &queries,
                 &report,
             )
             .await
@@ -565,8 +577,10 @@ async fn fill_range(
 
 /// Orchestrate a history lookup against the cache `conn`: derive the game number
 /// (cache fast-path, else incremental locate), fill any missing classic games,
-/// and return the range bounds. Parameterised on the chain anchors so tests can
-/// run it end-to-end against a synthetic chain in an in-memory database.
+/// run every requested dashboard query bound to that game, and return the range
+/// bounds plus the pre-computed result rows keyed by client-supplied id.
+/// Parameterised on the chain anchors so tests can run it end-to-end against a
+/// synthetic chain in an in-memory database.
 async fn run_history(
     conn: &libsql::Connection,
     game_hash: &str,
@@ -574,6 +588,7 @@ async fn run_history(
     chain_offset: u64,
     classic_start: u64,
     max_walk: u64,
+    queries: &[PrecomputeQuery],
     report: &dyn Fn(&str, u64, u64),
 ) -> Result<Prepared, String> {
     let game_hash = game_hash.trim();
@@ -608,10 +623,22 @@ async fn run_history(
         fill_range(conn, &start, game_number, lower, report).await?;
     }
 
+    // Per-query failures are skipped: the widget falls back to its on-demand `runQuery`.
+    let total_queries = queries.len() as u64;
+    let mut results: BTreeMap<String, Vec<serde_json::Map<String, Json>>> = BTreeMap::new();
+    for (i, q) in queries.iter().enumerate() {
+        report("aggregating", i as u64, total_queries);
+        if let Ok(rows) = query_rows(conn, &q.sql, vec![Json::from(game_number)]).await {
+            results.insert(q.id.clone(), rows);
+        }
+    }
+    report("aggregating", total_queries, total_queries);
+
     Ok(Prepared {
         from_game: game_number,
         to_game: classic_start,
         total_games: game_number - classic_start + 1,
+        results,
     })
 }
 
@@ -686,9 +713,18 @@ mod tests {
         let inception = synthetic_inception(START, 10);
         let classic_start = 1_000u64;
         let offset = classic_start - 5; // game_number = classic_start + 5
-        let p = run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        let p = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(p.from_game, classic_start + 5);
         assert_eq!(p.to_game, classic_start);
@@ -707,9 +743,18 @@ mod tests {
     async fn history_rejects_off_chain_hash() {
         let conn = mem_conn().await;
         let bogus = "0000000000000000000000000000000000000000000000000000000000000000";
-        assert!(run_history(&conn, START, bogus, 10_000_000, 1_000, 50, &|_, _, _| {})
-            .await
-            .is_err());
+        assert!(run_history(
+            &conn,
+            START,
+            bogus,
+            10_000_000,
+            1_000,
+            50,
+            &[],
+            &|_, _, _| {}
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
@@ -717,9 +762,18 @@ mod tests {
         let conn = mem_conn().await;
         // 3 steps, tiny offset → derived game_number well below classic_start.
         let inception = synthetic_inception(START, 3);
-        assert!(run_history(&conn, START, &inception, 100, 1_000_000, 50, &|_, _, _| {})
-            .await
-            .is_err());
+        assert!(run_history(
+            &conn,
+            START,
+            &inception,
+            100,
+            1_000_000,
+            50,
+            &[],
+            &|_, _, _| {}
+        )
+        .await
+        .is_err());
     }
 
     // Walking forward (sha256) generates OLDER games, so sha256^k(START) is the
@@ -737,9 +791,18 @@ mod tests {
 
         // Cold, single-shot computation of the full range.
         let cold = mem_conn().await;
-        let full = run_history(&cold, START, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        let full = run_history(
+            &cold,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
         let g = Json::from(full.from_game);
         let full_count = scalar(&cold, count_sql, vec![g.clone()]).await;
         let full_green = scalar(&cold, green_sql, vec![g.clone()]).await;
@@ -747,13 +810,31 @@ mod tests {
         // Incremental: first an older game (4 steps below START), then START.
         let older = synthetic_inception(START, 4); // game_number = classic_start + 1
         let inc = mem_conn().await;
-        let first = run_history(&inc, &older, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        let first = run_history(
+            &inc,
+            &older,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(first.from_game, classic_start + 1);
-        let second = run_history(&inc, START, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        let second = run_history(
+            &inc,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(second.from_game, full.from_game);
         assert_eq!(second.total_games, full.total_games);
@@ -767,14 +848,32 @@ mod tests {
         let inception = synthetic_inception(START, 10);
         let classic_start = 1_000u64;
         let offset = classic_start - 5;
-        let _ = run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        let _ = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
         // Second lookup of the same hash takes the cache fast-path: even with a
         // max_walk of 0 (no walking allowed) it must still succeed.
-        let again = run_history(&conn, START, &inception, offset, classic_start, 0, &|_, _, _| {})
-            .await
-            .unwrap();
+        let again = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            0,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(again.from_game, classic_start + 5);
     }
 
@@ -784,9 +883,18 @@ mod tests {
         let inception = synthetic_inception(START, 10);
         let classic_start = 1_000u64;
         let offset = classic_start - 5;
-        run_history(&conn, START, &inception, offset, classic_start, 100, &|_, _, _| {})
-            .await
-            .unwrap();
+        run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &[],
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
 
         // A representative dashboard-style query with a bound bound and mixed
         // column types (int + real + text).
@@ -802,6 +910,88 @@ mod tests {
         assert_eq!(rows[0]["games"].as_i64().unwrap(), 6);
         assert!(rows[0]["mean"].as_f64().unwrap() >= 1.0);
         assert!(rows[0]["h"].is_string());
+    }
+
+    #[tokio::test]
+    async fn precompute_runs_each_query_and_matches_on_demand() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+
+        let count_sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
+        let max_sql =
+            "SELECT MAX(bust_centi) / 100.0 AS c FROM games WHERE game_id <= ?1";
+        let queries = vec![
+            PrecomputeQuery {
+                id: "count".to_string(),
+                sql: count_sql.to_string(),
+            },
+            PrecomputeQuery {
+                id: "max".to_string(),
+                sql: max_sql.to_string(),
+            },
+        ];
+
+        let p = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &queries,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(p.results.len(), 2);
+        let g = Json::from(p.from_game);
+        let on_demand_count = scalar(&conn, count_sql, vec![g.clone()]).await;
+        let on_demand_rows =
+            query_rows(&conn, max_sql, vec![g]).await.unwrap();
+        let on_demand_max = on_demand_rows[0]["c"].as_f64().unwrap();
+        assert_eq!(
+            p.results["count"][0]["c"].as_i64().unwrap(),
+            on_demand_count
+        );
+        assert_eq!(p.results["max"][0]["c"].as_f64().unwrap(), on_demand_max);
+    }
+
+    #[tokio::test]
+    async fn precompute_skips_failing_queries() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+
+        let queries = vec![
+            PrecomputeQuery {
+                id: "ok".to_string(),
+                sql: "SELECT 1 AS c".to_string(),
+            },
+            PrecomputeQuery {
+                id: "bad".to_string(),
+                sql: "SELECT * FROM no_such_table".to_string(),
+            },
+        ];
+
+        let p = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &queries,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(p.results.contains_key("ok"));
+        assert!(!p.results.contains_key("bad"));
     }
 
     #[tokio::test]

@@ -2,6 +2,8 @@ import { StatWidget } from "./widgets/stat-widget";
 import { ChartWidget } from "./widgets/chart-widget";
 import { TabsWidget } from "./widgets/tabs-widget";
 import type { DashboardSpec, Widget, WidgetSize } from "@/lib/dashboard-spec";
+import type { Row } from "@/lib/query";
+import { widgetId } from "@/lib/views";
 
 // Flex-basis per size, so widgets fold gracefully as the window narrows. The
 // `0.5rem`/`0.75rem` subtractions account for the `gap-4` (1rem) between items.
@@ -18,15 +20,38 @@ function sizeOf(widget: Widget): WidgetSize {
   return "half";
 }
 
-function WidgetView({ widget, game }: { widget: Widget; game: number }) {
+function WidgetView({
+  widget,
+  game,
+  viewId,
+  rowIdx,
+  widgetIdx,
+  precomputed,
+}: {
+  widget: Widget;
+  game: number;
+  viewId: string;
+  rowIdx: number;
+  widgetIdx: number;
+  precomputed: Record<string, Row[]>;
+}) {
+  const id = widgetId(viewId, rowIdx, widgetIdx);
+  const data = precomputed[id];
   return (
     <div className={SIZE_CLASS[sizeOf(widget)]}>
       {widget.kind === "stat" ? (
-        <StatWidget widget={widget} game={game} />
+        <StatWidget widget={widget} game={game} precomputed={data} />
       ) : widget.kind === "tabs" ? (
-        <TabsWidget widget={widget} game={game} />
+        <TabsWidget
+          widget={widget}
+          game={game}
+          viewId={viewId}
+          rowIdx={rowIdx}
+          widgetIdx={widgetIdx}
+          precomputed={precomputed}
+        />
       ) : (
-        <ChartWidget widget={widget} game={game} />
+        <ChartWidget widget={widget} game={game} precomputed={data} />
       )}
     </div>
   );
@@ -39,16 +64,28 @@ function WidgetView({ widget, game }: { widget: Widget; game: number }) {
 export function DashboardRenderer({
   spec,
   game,
+  viewId,
+  precomputed,
 }: {
   spec: DashboardSpec;
   game: number;
+  viewId: string;
+  precomputed: Record<string, Row[]>;
 }) {
   return (
     <div className="flex flex-col gap-4">
       {spec.rows.map((row, i) => (
         <div key={i} className="flex flex-wrap gap-4">
           {row.widgets.map((widget, j) => (
-            <WidgetView key={j} widget={widget} game={game} />
+            <WidgetView
+              key={j}
+              widget={widget}
+              game={game}
+              viewId={viewId}
+              rowIdx={i}
+              widgetIdx={j}
+              precomputed={precomputed}
+            />
           ))}
         </div>
       ))}

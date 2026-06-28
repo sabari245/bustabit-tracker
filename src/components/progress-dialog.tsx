@@ -22,16 +22,17 @@ export function ProgressDialog({
   open: boolean;
   progress: HistoryProgress;
 }) {
-  const analyzing = progress.phase === "analyzing" && progress.total > 0;
+  const indeterminate = progress.phase === "locating";
   const aggregating = progress.phase === "aggregating";
-  const percent = analyzing
+  const showBar = !indeterminate && progress.total > 0;
+  const percent = showBar
     ? Math.min(100, Math.round((progress.current / progress.total) * 100))
     : 0;
 
-  const description = analyzing
-    ? "Computing and caching the games we don't have yet."
-    : aggregating
-      ? "Summarising the history from the local cache."
+  const description = aggregating
+    ? "Summarising the history from the local cache."
+    : progress.phase === "analyzing"
+      ? "Computing and caching the games we don't have yet."
       : "Locating the game on the chain and verifying it's genuine.";
 
   return (
@@ -47,16 +48,19 @@ export function ProgressDialog({
         </DialogHeader>
 
         <div className="flex flex-col gap-3 py-2">
-          <Progress value={analyzing ? percent : null} />
+          <Progress value={showBar ? percent : null} />
           <div className="flex items-center gap-2 text-sm text-muted-foreground tabular-nums">
-            {!analyzing && <Loader2 className="h-4 w-4 animate-spin" />}
-            {analyzing ? (
+            {indeterminate && <Loader2 className="h-4 w-4 animate-spin" />}
+            {aggregating ? (
+              <span>
+                {progress.current.toLocaleString()} /{" "}
+                {progress.total.toLocaleString()} widgets ({percent}%)
+              </span>
+            ) : progress.phase === "analyzing" ? (
               <span>
                 {progress.current.toLocaleString()} /{" "}
                 {progress.total.toLocaleString()} games ({percent}%)
               </span>
-            ) : aggregating ? (
-              <span>Crunching the numbers…</span>
             ) : (
               <span>{progress.current.toLocaleString()} hashes scanned…</span>
             )}

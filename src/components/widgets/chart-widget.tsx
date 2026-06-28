@@ -144,15 +144,22 @@ export function ChartWidget({
   widget,
   game,
   embedded = false,
+  precomputed,
 }: {
   widget: ChartWidgetSpec;
   game: number;
   embedded?: boolean;
+  precomputed?: Row[];
 }) {
   const [data, setData] = useState<Row[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (precomputed) {
+      setData(precomputed);
+      setError(null);
+      return;
+    }
     let active = true;
     setData(null);
     setError(null);
@@ -162,7 +169,7 @@ export function ChartWidget({
     return () => {
       active = false;
     };
-  }, [widget.sql, game]);
+  }, [widget.sql, game, precomputed]);
 
   const { x, series } = resolveAxes(widget, data ?? []);
   const config: ChartConfig = Object.fromEntries(

@@ -38,3 +38,38 @@ export function parseSpec(spec: string): DashboardSpec | null {
     return null;
   }
 }
+
+export type PrecomputeQuery = { id: string; sql: string };
+
+// `viewId` is the owning view prefix (`builtin` or `view:<id>`); `tabValue` disambiguates the charts inside a `tabs` widget.
+export function widgetId(
+  viewId: string,
+  rowIdx: number,
+  widgetIdx: number,
+  tabValue?: string,
+): string {
+  const base = `${viewId}:r${rowIdx}w${widgetIdx}`;
+  return tabValue ? `${base}:${tabValue}` : base;
+}
+
+export function extractQueries(
+  viewId: string,
+  spec: DashboardSpec,
+): PrecomputeQuery[] {
+  const out: PrecomputeQuery[] = [];
+  spec.rows.forEach((row, ri) => {
+    row.widgets.forEach((w, wi) => {
+      if (w.kind === "stat" || w.kind === "chart") {
+        out.push({ id: widgetId(viewId, ri, wi), sql: w.sql });
+      } else if (w.kind === "tabs") {
+        w.tabs.forEach((t) => {
+          out.push({
+            id: widgetId(viewId, ri, wi, t.value),
+            sql: t.chart.sql,
+          });
+        });
+      }
+    });
+  });
+  return out;
+}

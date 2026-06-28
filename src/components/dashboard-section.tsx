@@ -22,6 +22,7 @@ import {
 import { DashboardRenderer } from "@/components/dashboard-renderer";
 import { ViewEditor } from "@/components/view-editor";
 import { DASHBOARD, type DashboardSpec } from "@/lib/dashboard-spec";
+import type { Row } from "@/lib/query";
 import {
   deleteView,
   listViews,
@@ -31,7 +32,13 @@ import {
 
 const BUILTIN = "builtin";
 
-export function DashboardSection({ game }: { game: number }) {
+export function DashboardSection({
+  game,
+  precomputed,
+}: {
+  game: number;
+  precomputed: Record<string, Row[]>;
+}) {
   const [views, setViews] = useState<SavedView[]>([]);
   const [selected, setSelected] = useState<string>(BUILTIN);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -49,6 +56,8 @@ export function DashboardSection({ game }: { game: number }) {
 
   const spec: DashboardSpec =
     selected === BUILTIN ? DASHBOARD : parseSpec(activeView?.spec ?? "") ?? { rows: [] };
+
+  const viewId = selected === BUILTIN ? "builtin" : `view:${activeView?.id ?? ""}`;
 
   function openNew() {
     setEditing(null);
@@ -115,7 +124,12 @@ export function DashboardSection({ game }: { game: number }) {
         </Button>
       </div>
 
-      <DashboardRenderer spec={spec} game={game} />
+      <DashboardRenderer
+        spec={spec}
+        game={game}
+        viewId={viewId}
+        precomputed={precomputed}
+      />
 
       <ViewEditor
         open={editorOpen}

@@ -30,14 +30,21 @@ function fillHint(template: string, row: Row): string {
 export function StatWidget({
   widget,
   game,
+  precomputed,
 }: {
   widget: StatWidgetSpec;
   game: number;
+  precomputed?: Row[];
 }) {
   const [row, setRow] = useState<Row | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (precomputed) {
+      setRow(precomputed[0] ?? {});
+      setError(null);
+      return;
+    }
     let active = true;
     setRow(null);
     setError(null);
@@ -47,7 +54,7 @@ export function StatWidget({
     return () => {
       active = false;
     };
-  }, [widget.sql, game]);
+  }, [widget.sql, game, precomputed]);
 
   return (
     <Card className="h-full">
