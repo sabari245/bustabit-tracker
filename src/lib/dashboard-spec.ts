@@ -39,6 +39,9 @@ export type ChartWidgetSpec = {
   x?: string;
   /** Series to plot. Auto-derived (the numeric columns) when omitted. */
   series?: Series[];
+  /** Axis titles drawn alongside each axis (user-authored views supply these). */
+  xTitle?: string;
+  yTitle?: string;
   refLine?: number;
   yUnit?: string;
   yDomain?: [number, number];

@@ -229,7 +229,10 @@ async fn run_query(
             // Wait (up to 5s) for a competing writer's lock to clear instead of
             // failing instantly with "database is locked" when adding a chart races
             // a layout save or a sibling widget's cache write.
-            conn.execute("PRAGMA busy_timeout = 5000", ())
+            // `PRAGMA busy_timeout = N` reports back the new value as a result row,
+            // so it must go through `query` — `execute` rejects row-returning
+            // statements with "Execute returned rows".
+            conn.query("PRAGMA busy_timeout = 5000", ())
                 .await
                 .map_err(|e| format!("couldn't set busy timeout: {e}"))?;
 

@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
-import { Check, Copy } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Check, Copy, ExternalLink } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -10,49 +11,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  ToggleGroup,
+  ToggleGroupItem,
+} from "@/components/ui/toggle-group";
 import { StatWidget } from "@/components/widgets/stat-widget";
 import { ChartWidget } from "@/components/widgets/chart-widget";
-import { AI_PROMPT } from "@/lib/ai-prompt";
+import { AI_PROMPT, chatGptUrl } from "@/lib/ai-prompt";
 import type { Widget } from "@/lib/dashboard-spec";
+import type { Row } from "@/lib/query";
+import { runQuery } from "@/lib/query";
 import { newWidgetId } from "@/lib/layout";
+import {
+  buildWidget,
+  compatibleTypes,
+  parseWidgetJson,
+  TYPE_LABELS,
+  widgetToJson,
+  type DraftType,
+} from "@/lib/widget-spec";
 
-type DraftType = "stat" | "bar" | "line" | "area";
-
-const TYPE_LABELS: Record<DraftType, string> = {
-  stat: "Stat (single value)",
-  bar: "Bar chart",
-  line: "Line chart",
-  area: "Area chart",
-};
-
-function widgetToDraft(w: Widget): { title: string; type: DraftType; sql: string } {
-  if (w.kind === "stat") return { title: w.title, type: "stat", sql: w.sql };
-  if (w.kind === "chart") return { title: w.title, type: w.type, sql: w.sql };
-  return { title: w.title, type: "bar", sql: "" };
-}
-
-function buildWidget(
-  id: string,
-  title: string,
-  type: DraftType,
-  sql: string,
-): Widget {
-  const t = title.trim() || "Untitled";
-  if (type === "stat") return { kind: "stat", id, title: t, sql };
-  return { kind: "chart", id, type, title: t, sql };
-}
-
-/** Dialog to author or edit a single dashboard chart/card. */
+/** Dialog to author or edit a single dashboard widget from pasted assistant JSON. */
 export function ChartEditor({
   open,
   onOpenChange,
@@ -66,15 +47,25 @@ export function ChartEditor({
   editing: Widget | null;
   onSave: (widget: Widget) => void;
 }) {
-  const [title, setTitle] = useState("");
-  const [type, setType] = useState<DraftType>("stat");
-  const [sql, setSql] = useState("");
+  const [jsonText, setJsonText] = useState("");
+  const [selType, setSelType] = useState<DraftType | null>(null);
+  const [rows, setRows] = useState<Row[] | null>(null);
+  const [runError, setRunError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const [preview, setPreview] = useState(false);
   const seeded = useRef(false);
 
-  // Seed the form whenever the dialog opens (from the edited widget or blank).
+  const parsed = useMemo(() => parseWidgetJson(jsonText), [jsonText]);
+  const draft = parsed.draft;
+
+  // Render types the result actually supports. Without a history lookup we can't
+  // run the query, so we fall back to the assistant's suggested type alone.
+  const options = useMemo<DraftType[]>(
+    () => (rows ? compatibleTypes(rows) : draft ? [draft.type] : []),
+    [rows, draft],
+  );
+
+  // Seed the box whenever the dialog opens (from the edited widget or blank).
   useEffect(() => {
     if (!open) {
       seeded.current = false;
@@ -83,18 +74,45 @@ export function ChartEditor({
     if (seeded.current) return;
     seeded.current = true;
     setError(null);
-    setPreview(false);
-    if (editing) {
-      const d = widgetToDraft(editing);
-      setTitle(d.title);
-      setType(d.type);
-      setSql(d.sql);
-    } else {
-      setTitle("");
-      setType("stat");
-      setSql("");
-    }
+    setRunError(null);
+    setRows(null);
+    setSelType(null);
+    setJsonText(editing ? widgetToJson(editing) : "");
   }, [open, editing]);
+
+  // Run the query once per (valid JSON, game) so we can detect types and preview.
+  useEffect(() => {
+    if (!open || !draft || game == null) {
+      setRows(null);
+      setRunError(null);
+      return;
+    }
+    let active = true;
+    setRunError(null);
+    runQuery(draft.sql, [game])
+      .then((r) => active && (setRows(r), setRunError(null)))
+      .catch((e) => active && (setRows(null), setRunError(String(e))));
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, draft?.sql, game]);
+
+  // Keep the selected type valid: prefer the current pick, else the assistant's
+  // suggestion, else the first compatible option.
+  useEffect(() => {
+    if (options.length === 0) {
+      setSelType(null);
+      return;
+    }
+    setSelType((prev) =>
+      prev && options.includes(prev)
+        ? prev
+        : draft && options.includes(draft.type)
+          ? draft.type
+          : options[0],
+    );
+  }, [options, draft]);
 
   async function copyPrompt() {
     await navigator.clipboard.writeText(AI_PROMPT);
@@ -103,95 +121,129 @@ export function ChartEditor({
   }
 
   function save() {
-    if (sql.trim() === "") {
-      setError("Add a SQL query for this chart.");
+    if (!draft) {
+      setError(parsed.error ?? "Paste the widget JSON first.");
+      return;
+    }
+    if (!selType) {
+      setError("Pick how to display it.");
       return;
     }
     const id = editing?.id ?? newWidgetId();
-    onSave(buildWidget(id, title, type, sql));
+    onSave(buildWidget(id, draft, selType));
     onOpenChange(false);
   }
 
-  const previewWidget = buildWidget("preview", title, type, sql);
+  const previewWidget =
+    draft && selType ? buildWidget("preview", draft, selType) : null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[85vh] gap-4 overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>{editing ? "Edit chart" : "New chart"}</DialogTitle>
+          <DialogTitle>{editing ? "Edit widget" : "New widget"}</DialogTitle>
           <DialogDescription>
-            One SQL query plus a chart type. Use “Copy AI prompt” if you’d rather
-            have an assistant write the SQL for you.
+            Let an assistant write it for you: copy the prompt (or open it
+            straight in ChatGPT), describe what you want, then paste the JSON it
+            replies with below.
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex items-center gap-2">
-          <Input
-            placeholder="Chart title"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-          />
-          <Select value={type} onValueChange={(v) => setType(v as DraftType)}>
-            <SelectTrigger className="w-[190px] shrink-0">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {(Object.keys(TYPE_LABELS) as DraftType[]).map((t) => (
-                <SelectItem key={t} value={t}>
-                  {TYPE_LABELS[t]}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={copyPrompt}>
+            {copied ? <Check /> : <Copy />}
+            {copied ? "Copied!" : "Copy prompt"}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => openUrl(chatGptUrl())}
+          >
+            <ExternalLink />
+            Open in ChatGPT
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Opens a new chat with the prompt already filled in.
+          </span>
         </div>
 
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
-            <Label>SQL query</Label>
-            <Button type="button" variant="outline" size="sm" onClick={copyPrompt}>
-              {copied ? <Check /> : <Copy />}
-              {copied ? "Copied!" : "Copy AI prompt"}
-            </Button>
-          </div>
+          <Label>Paste widget JSON</Label>
           <Textarea
-            placeholder="SELECT … FROM games WHERE game_id <= ?1"
-            className="min-h-[120px] font-mono text-xs"
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
+            placeholder={'{\n  "type": "bar",\n  "title": "…",\n  "sql": "SELECT … FROM games WHERE game_id <= ?1"\n}'}
+            className="min-h-[140px] font-mono text-xs"
+            value={jsonText}
+            onChange={(e) => setJsonText(e.target.value)}
           />
-          <p className="text-xs text-muted-foreground">
-            Paste the “Copy AI prompt” text into ChatGPT/Claude, describe what you
-            want, then paste the SQL it gives back here.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <Button
-            type="button"
-            variant="secondary"
-            size="sm"
-            disabled={game == null || sql.trim() === ""}
-            onClick={() => setPreview((p) => !p)}
-          >
-            {preview ? "Hide preview" : "Preview"}
-          </Button>
-          {game == null && (
-            <span className="text-xs text-muted-foreground">
-              Run a history lookup first to preview.
-            </span>
+          {jsonText.trim() !== "" && parsed.error && (
+            <p className="text-xs text-destructive">{parsed.error}</p>
           )}
         </div>
 
-        {preview && game != null && (
-          <div className="rounded-md border p-3">
-            {previewWidget.kind === "stat" ? (
-              <div className="max-w-[260px]">
-                <StatWidget widget={previewWidget} game={game} />
-              </div>
-            ) : previewWidget.kind === "chart" ? (
-              <ChartWidget widget={previewWidget} game={game} embedded />
-            ) : null}
+        {draft && (
+          <div className="flex flex-col gap-2">
+            <Label>Display as</Label>
+            {options.length > 0 ? (
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                value={selType ?? ""}
+                onValueChange={(v) => v && setSelType(v as DraftType)}
+                className="justify-start"
+              >
+                {options.map((t) => (
+                  <ToggleGroupItem key={t} value={t} className="px-3">
+                    {TYPE_LABELS[t]}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {game == null
+                  ? "Run a history lookup first to detect the available styles."
+                  : "Waiting for the query to run…"}
+              </p>
+            )}
+            {rows != null && (
+              <p className="text-xs text-muted-foreground">
+                Auto-detected from the query result
+                {game != null && ` · ${rows.length} row${rows.length === 1 ? "" : "s"}`}.
+              </p>
+            )}
           </div>
+        )}
+
+        {runError && <p className="text-sm text-destructive">{runError}</p>}
+
+        {previewWidget && game != null && rows != null && !runError && (
+          <div className="flex flex-col gap-2">
+            <Label>Preview</Label>
+            <div className="rounded-md border p-3">
+              {previewWidget.kind === "stat" ? (
+                <div className="max-w-[260px]">
+                  <StatWidget
+                    widget={previewWidget}
+                    game={game}
+                    precomputed={rows}
+                  />
+                </div>
+              ) : previewWidget.kind === "chart" ? (
+                <ChartWidget
+                  widget={previewWidget}
+                  game={game}
+                  embedded
+                  precomputed={rows}
+                />
+              ) : null}
+            </div>
+          </div>
+        )}
+
+        {draft && game == null && (
+          <p className="text-xs text-muted-foreground">
+            Run a history lookup to see a live preview before saving.
+          </p>
         )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
@@ -200,7 +252,9 @@ export function ChartEditor({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={save}>{editing ? "Save changes" : "Add chart"}</Button>
+          <Button onClick={save} disabled={!draft}>
+            {editing ? "Save changes" : "Add widget"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

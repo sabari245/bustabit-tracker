@@ -169,6 +169,9 @@ export function UplotChart({
           ticks: { show: false },
           splits: () => xs.filter((i) => i % labelStep === 0),
           values: (_u, sp) => sp.map((i) => labels[i] ?? ""),
+          label: widget.xTitle,
+          labelFont: FONT,
+          labelSize: widget.xTitle ? 18 : undefined,
         },
         {
           font: FONT,
@@ -177,6 +180,9 @@ export function UplotChart({
           grid: { show: true, stroke: css("var(--border)"), width: 1 },
           ticks: { show: false },
           values: (_u, sp) => sp.map((v) => `${v}${widget.yUnit ?? ""}`),
+          label: widget.yTitle,
+          labelFont: FONT,
+          labelSize: widget.yTitle ? 18 : undefined,
         },
       ],
       series: [
