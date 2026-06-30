@@ -1,5 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Plus } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
+import { Check, Download, Loader2, Plus } from "lucide-react";
 
 import {
   AlertDialog,
@@ -46,6 +48,35 @@ export function DashboardSection({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Widget | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exported, setExported] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  // Save the whole cached game history to an .xlsx file the user picks. The
+  // workbook itself is built in Rust (see the `export_history` command).
+  async function exportXlsx() {
+    setExportError(null);
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    try {
+      const path = await save({
+        title: "Export game history",
+        defaultPath: `bustabit-history-${date}.xlsx`,
+        filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
+      });
+      if (!path) return; // user cancelled the dialog
+      setExporting(true);
+      const generatedAt = `${date} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+      await invoke("export_history", { path, generatedAt });
+      setExported(true);
+      setTimeout(() => setExported(false), 2000);
+    } catch (e) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
 
   function openNew() {
     setEditing(null);
@@ -99,11 +130,31 @@ export function DashboardSection({
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold">Dashboard</h2>
-        <Button size="sm" onClick={openNew}>
-          <Plus />
-          Add chart
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={exportXlsx}
+            disabled={exporting}
+          >
+            {exporting ? (
+              <Loader2 className="animate-spin" />
+            ) : exported ? (
+              <Check />
+            ) : (
+              <Download />
+            )}
+            {exporting ? "Exporting…" : exported ? "Exported" : "Export XLSX"}
+          </Button>
+          <Button size="sm" onClick={openNew}>
+            <Plus />
+            Add chart
+          </Button>
+        </div>
       </div>
+      {exportError && (
+        <p className="text-sm text-destructive">{exportError}</p>
+      )}
 
       <DashboardGrid
         rows={layout.rows}

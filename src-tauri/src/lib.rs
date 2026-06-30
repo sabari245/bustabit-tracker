@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use hmac::{Hmac, Mac};
+use rust_xlsxwriter::{Color, Format, FormatBorder, Workbook};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -734,17 +735,169 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+/// Excel caps a worksheet at 1,048,576 rows; we leave headroom for the title and
+/// header rows and split the export across sheets once the history is bigger.
+const XLSX_ROWS_PER_SHEET: u64 = 1_000_000;
+
+/// Total number of games currently in the cache.
+async fn count_games(conn: &libsql::Connection) -> Result<u64, String> {
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM games", ())
+        .await
+        .map_err(|e| format!("count failed: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("count failed: {e}"))?
+        .ok_or_else(|| "count returned no rows".to_string())?;
+    let c: i64 = row.get(0).map_err(|e| format!("count failed: {e}"))?;
+    Ok(c.max(0) as u64)
+}
+
+/// Export the entire cached game history to an `.xlsx` file at `path`. The whole
+/// `games` table is written — game number, provably-fair hash, the bust multiplier
+/// (centi → real ×), and the 2× green/red result — under a titled, frozen header.
+/// History larger than one Excel sheet is split across consecutive sheets. Streams
+/// rows straight from libSQL into the workbook (keyset-paginated by game_id) so the
+/// export stays memory-cheap even for millions of games. Returns the rows written.
+#[tauri::command]
+async fn export_history(
+    app: tauri::AppHandle,
+    path: String,
+    generated_at: String,
+) -> Result<u64, String> {
+    let db_path = db_path(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime init failed: {e}"))?;
+        rt.block_on(async move {
+            let db = libsql::Builder::new_local(db_path)
+                .build()
+                .await
+                .map_err(|e| format!("couldn't open cache db: {e}"))?;
+            let conn = db
+                .connect()
+                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+
+            let total = count_games(&conn).await?;
+
+            let title_fmt = Format::new().set_bold().set_font_size(16.0);
+            let meta_fmt = Format::new().set_italic().set_font_color(Color::RGB(0x808080));
+            let header_fmt = Format::new()
+                .set_bold()
+                .set_background_color(Color::RGB(0xF2F2F2))
+                .set_border_bottom(FormatBorder::Thin);
+            let mult_fmt = Format::new().set_num_format("0.00");
+            let headers = ["Game #", "Hash", "Bust Multiplier (x)", "Result"];
+
+            let sheets = if total == 0 {
+                1
+            } else {
+                ((total + XLSX_ROWS_PER_SHEET - 1) / XLSX_ROWS_PER_SHEET) as u32
+            };
+
+            let mut workbook = Workbook::new();
+            let mut last_id: i64 = i64::MIN; // game_id is positive; matches all rows
+            let mut written: u64 = 0;
+
+            for s in 0..sheets {
+                let name = if sheets == 1 {
+                    "Game History".to_string()
+                } else {
+                    format!("Games {}", s + 1)
+                };
+                let sheet = workbook
+                    .add_worksheet()
+                    .set_name(&name)
+                    .map_err(|e| format!("couldn't create sheet: {e}"))?;
+                sheet.set_column_width(0, 12.0).ok();
+                sheet.set_column_width(1, 66.0).ok();
+                sheet.set_column_width(2, 18.0).ok();
+                sheet.set_column_width(3, 12.0).ok();
+
+                // The first sheet carries the report title and metadata; every sheet
+                // repeats the column headers and freezes them in place.
+                let header_row: u32 = if s == 0 { 4 } else { 0 };
+                if s == 0 {
+                    sheet
+                        .merge_range(0, 0, 0, 3, "Bustabit Game History", &title_fmt)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                    sheet
+                        .write_with_format(1, 0, format!("Exported {generated_at}"), &meta_fmt)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                    sheet
+                        .write_with_format(2, 0, format!("Total games: {total}"), &meta_fmt)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
+                for (c, h) in headers.iter().enumerate() {
+                    sheet
+                        .write_with_format(header_row, c as u16, *h, &header_fmt)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                }
+                sheet
+                    .set_freeze_panes(header_row + 1, 0)
+                    .map_err(|e| format!("freeze failed: {e}"))?;
+
+                let mut data_row = header_row + 1;
+                let mut rows = conn
+                    .query(
+                        "SELECT game_id, hash, bust_centi, is_green FROM games \
+                         WHERE game_id > ?1 ORDER BY game_id LIMIT ?2",
+                        libsql::params![last_id, XLSX_ROWS_PER_SHEET as i64],
+                    )
+                    .await
+                    .map_err(|e| format!("export query failed: {e}"))?;
+
+                while let Some(r) = rows.next().await.map_err(|e| format!("export read failed: {e}"))? {
+                    let gid: i64 = r.get(0).map_err(|e| format!("export read failed: {e}"))?;
+                    let hash: String = r.get(1).map_err(|e| format!("export read failed: {e}"))?;
+                    let bust_centi: i64 = r.get(2).map_err(|e| format!("export read failed: {e}"))?;
+                    let is_green: i64 = r.get(3).map_err(|e| format!("export read failed: {e}"))?;
+
+                    sheet
+                        .write_number(data_row, 0, gid as f64)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                    sheet
+                        .write_string(data_row, 1, &hash)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                    sheet
+                        .write_number_with_format(data_row, 2, bust_centi as f64 / 100.0, &mult_fmt)
+                        .map_err(|e| format!("write failed: {e}"))?;
+                    sheet
+                        .write_string(data_row, 3, if is_green != 0 { "Green" } else { "Red" })
+                        .map_err(|e| format!("write failed: {e}"))?;
+
+                    data_row += 1;
+                    last_id = gid;
+                    written += 1;
+                }
+            }
+
+            workbook
+                .save(&path)
+                .map_err(|e| format!("couldn't write xlsx: {e}"))?;
+            Ok(written)
+        })
+    })
+    .await
+    .map_err(|e| format!("export failed to run: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             greet,
             bust_from_hash,
             compute_history,
             run_query,
             load_layout,
-            save_layout
+            save_layout,
+            export_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
