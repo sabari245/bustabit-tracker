@@ -126,7 +126,9 @@ function App() {
                   />
                 </div>
                 <Button type="submit" disabled={!canSubmit || loading}>
-                  {loading && <Loader2 className="animate-spin" />}
+                  {loading && (
+                    <Loader2 data-icon="inline-start" className="animate-spin" />
+                  )}
                   {loading ? "Computing…" : "Compute history"}
                 </Button>
               </form>

@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-react";
+import { Check, Loader2 } from "lucide-react";
 
 import {
   Dialog,
@@ -14,6 +14,8 @@ export type HistoryProgress = {
   current: number;
   total: number;
 };
+
+export type ExportProgress = HistoryProgress;
 
 export function ProgressDialog({
   open,
@@ -63,6 +65,74 @@ export function ProgressDialog({
               </span>
             ) : (
               <span>{progress.current.toLocaleString()} hashes scanned…</span>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function ExportProgressDialog({
+  open,
+  progress,
+}: {
+  open: boolean;
+  progress: ExportProgress;
+}) {
+  const completed = progress.phase === "completed";
+  const writing = progress.phase === "writing";
+  const showBar = completed || (progress.total > 0 && writing);
+  const percent = completed
+    ? 100
+    : showBar
+      ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+      : 0;
+
+  const description =
+    progress.phase === "saving"
+      ? "Saving the workbook to the selected XLSX file."
+      : completed
+        ? "The XLSX export has finished."
+        : writing
+          ? "Writing the cached game history into the workbook."
+          : "Loading cached history and preparing the workbook.";
+
+  return (
+    <Dialog open={open} onOpenChange={() => {}}>
+      <DialogContent
+        showCloseButton={false}
+        onInteractOutside={(e) => e.preventDefault()}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>
+            {completed ? "Export complete" : "Exporting XLSX"}
+          </DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-3 py-2">
+          <Progress value={showBar ? percent : null} />
+          <div className="flex items-center gap-2 text-sm text-muted-foreground tabular-nums">
+            {completed ? (
+              <Check />
+            ) : (
+              <Loader2 className="animate-spin" />
+            )}
+            {completed ? (
+              <span>{progress.current.toLocaleString()} rows exported</span>
+            ) : writing && progress.total > 0 ? (
+              <span>
+                {progress.current.toLocaleString()} /{" "}
+                {progress.total.toLocaleString()} rows ({percent}%)
+              </span>
+            ) : progress.phase === "saving" ? (
+              <span>Saving file…</span>
+            ) : progress.total > 0 ? (
+              <span>{progress.total.toLocaleString()} rows ready to export</span>
+            ) : (
+              <span>Loading cached history…</span>
             )}
           </div>
         </div>

@@ -9,7 +9,7 @@ import {
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { UplotChart } from "@/components/widgets/uplot-chart";
-import { runQuery, type Row } from "@/lib/query";
+import { isNumericCell, runQuery, type Row } from "@/lib/query";
 import {
   CHART_PALETTE,
   type ChartWidgetSpec,
@@ -31,9 +31,13 @@ function resolveAxes(
     return { x, series: widget.series };
   }
   const numeric = cols.filter(
-    (c) => c !== x && data.some((r) => typeof r[c] === "number"),
+    (c) => c !== x && data.some((r) => isNumericCell(r[c])),
   );
-  const series = numeric.map((c, i) => ({
+  const nullable = cols.filter(
+    (c) => c !== x && data.every((r) => r[c] == null),
+  );
+  const autoSeries = numeric.length > 0 ? numeric : nullable;
+  const series = autoSeries.map((c, i) => ({
     key: c,
     label: c,
     color: CHART_PALETTE[i % CHART_PALETTE.length],

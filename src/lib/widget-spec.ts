@@ -4,7 +4,7 @@
 // and the *shape of the result* decides which render types are even possible. The
 // user then picks among those auto-detected options and saves.
 
-import type { Row } from "@/lib/query";
+import { isNumericCell, type Row } from "@/lib/query";
 import type { Widget } from "@/lib/dashboard-spec";
 
 export type DraftType = "stat" | "bar" | "line" | "area";
@@ -38,6 +38,44 @@ function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
 }
 
+function escapeControlCharsInStrings(text: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+
+  for (const ch of text) {
+    if (!inString) {
+      out += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      out += ch;
+      escaped = true;
+    } else if (ch === '"') {
+      out += ch;
+      inString = false;
+    } else if (ch === "\n") {
+      out += "\\n";
+    } else if (ch === "\r") {
+      out += "\\n";
+    } else if (ch === "\t") {
+      out += "\\t";
+    } else {
+      out += ch;
+    }
+  }
+
+  return out;
+}
+
 /**
  * Parse the JSON the user pastes from ChatGPT/Claude into a draft. Tolerant of a
  * ```json fenced code block (assistants love wrapping output in one). Returns an
@@ -60,9 +98,13 @@ export function parseWidgetJson(text: string): {
   try {
     obj = JSON.parse(unfenced);
   } catch {
-    return {
-      error: "That isn't valid JSON — copy the whole { … } object the assistant returned.",
-    };
+    try {
+      obj = JSON.parse(escapeControlCharsInStrings(unfenced));
+    } catch {
+      return {
+        error: "That isn't valid JSON — copy the whole { … } object the assistant returned.",
+      };
+    }
   }
   if (typeof obj !== "object" || obj == null || Array.isArray(obj)) {
     return { error: "Expected a single JSON object describing the widget." };
@@ -105,17 +147,21 @@ export function compatibleTypes(rows: Row[]): DraftType[] {
   const cols = Object.keys(rows[0]);
   const x = cols[0];
   const numericSeries = cols.filter(
-    (c) => c !== x && rows.some((r) => typeof r[c] === "number"),
+    (c) => c !== x && rows.some((r) => isNumericCell(r[c])),
   );
+  const nullableSeries = cols.filter(
+    (c) => c !== x && rows.every((r) => r[c] == null),
+  );
+  const chartSeries = numericSeries.length > 0 ? numericSeries : nullableSeries;
 
   const types: DraftType[] = [];
   if (cols.includes("value")) types.push("stat");
-  if (rows.length >= 2 && numericSeries.length > 0) {
+  if (rows.length >= 2 && chartSeries.length > 0) {
     types.push("bar", "line", "area");
   }
 
   if (types.length === 0) {
-    if (numericSeries.length > 0) types.push("bar", "line", "area");
+    if (chartSeries.length > 0) types.push("bar", "line", "area");
     else types.push("stat");
   }
   return types;

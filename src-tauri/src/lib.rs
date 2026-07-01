@@ -13,6 +13,10 @@ use tauri::{Emitter, Manager};
 /// total number of events tiny (a few dozen per run).
 const PROGRESS_MASK: u64 = 0x3FFFF;
 
+/// How often to emit XLSX export progress while streaming rows into the workbook.
+/// Roughly every 16k rows gives visible feedback without spamming the webview.
+const EXPORT_PROGRESS_MASK: u64 = 0x3FFF;
+
 /// Rows per batched INSERT when filling the cache. Big enough that the per-
 /// statement overhead is negligible, small enough to keep the SQL string and
 /// the SQLite parser comfortable.
@@ -105,8 +109,8 @@ fn bust_from_hash(game_hash: &str) -> Result<f64, String> {
     compute_bust(game_hash)
 }
 
-/// Progress event payload emitted during the walk. `total` is 0 while locating
-/// the game (the length isn't known yet); it's the game count while analyzing.
+/// Progress event payload emitted by long-running commands.
+/// `total` is 0 while the command is in an indeterminate setup/finalization phase.
 #[derive(Clone, Serialize)]
 struct Progress {
     phase: String,
@@ -767,12 +771,25 @@ async fn export_history(
     generated_at: String,
 ) -> Result<u64, String> {
     let db_path = db_path(&app)?;
+    let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("runtime init failed: {e}"))?;
         rt.block_on(async move {
+            let report = |phase: &str, current: u64, total: u64| {
+                let _ = app.emit(
+                    "export-progress",
+                    Progress {
+                        phase: phase.to_string(),
+                        current,
+                        total,
+                    },
+                );
+            };
+
+            report("loading", 0, 0);
             let db = libsql::Builder::new_local(db_path)
                 .build()
                 .await
@@ -782,9 +799,12 @@ async fn export_history(
                 .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
 
             let total = count_games(&conn).await?;
+            report("loading", 0, total);
 
             let title_fmt = Format::new().set_bold().set_font_size(16.0);
-            let meta_fmt = Format::new().set_italic().set_font_color(Color::RGB(0x808080));
+            let meta_fmt = Format::new()
+                .set_italic()
+                .set_font_color(Color::RGB(0x808080));
             let header_fmt = Format::new()
                 .set_bold()
                 .set_background_color(Color::RGB(0xF2F2F2))
@@ -801,6 +821,7 @@ async fn export_history(
             let mut workbook = Workbook::new();
             let mut last_id: i64 = i64::MIN; // game_id is positive; matches all rows
             let mut written: u64 = 0;
+            report("writing", written, total);
 
             for s in 0..sheets {
                 let name = if sheets == 1 {
@@ -872,12 +893,17 @@ async fn export_history(
                     data_row += 1;
                     last_id = gid;
                     written += 1;
+                    if written == total || (written & EXPORT_PROGRESS_MASK) == 0 {
+                        report("writing", written, total);
+                    }
                 }
             }
 
+            report("saving", written, total);
             workbook
                 .save(&path)
                 .map_err(|e| format!("couldn't write xlsx: {e}"))?;
+            report("completed", written, total);
             Ok(written)
         })
     })

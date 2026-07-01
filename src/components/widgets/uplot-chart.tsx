@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
-import type { Row } from "@/lib/query";
+import { chartNumber, type Row } from "@/lib/query";
 import type { ChartWidgetSpec, Series } from "@/lib/dashboard-spec";
 
 const FONT = "11px 'Inter Variable', sans-serif";
@@ -123,9 +123,7 @@ export function UplotChart({
     const colors = series.map((s) => css(s.color));
     const aligned: uPlot.AlignedData = [
       xs,
-      ...series.map((s) =>
-        data.map((r) => (typeof r[s.key] === "number" ? (r[s.key] as number) : null)),
-      ),
+      ...series.map((s) => data.map((r) => chartNumber(r[s.key]))),
     ];
 
     const isBar = widget.type === "bar";

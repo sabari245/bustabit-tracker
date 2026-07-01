@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { Check, Download, Loader2, Plus } from "lucide-react";
 
@@ -16,6 +17,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { DashboardGrid } from "@/components/dashboard-grid";
 import { ChartEditor } from "@/components/chart-editor";
+import {
+  ExportProgressDialog,
+  type ExportProgress,
+} from "@/components/progress-dialog";
 import { StatWidget } from "@/components/widgets/stat-widget";
 import { ChartWidget } from "@/components/widgets/chart-widget";
 import { TabsWidget } from "@/components/widgets/tabs-widget";
@@ -51,11 +56,19 @@ export function DashboardSection({
   const [exporting, setExporting] = useState(false);
   const [exported, setExported] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportProgress, setExportProgress] = useState<ExportProgress>({
+    phase: "loading",
+    current: 0,
+    total: 0,
+  });
 
   // Save the whole cached game history to an .xlsx file the user picks. The
   // workbook itself is built in Rust (see the `export_history` command).
   async function exportXlsx() {
     setExportError(null);
+    setExported(false);
+    let unlisten: (() => void) | null = null;
     const now = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
     const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
@@ -66,14 +79,30 @@ export function DashboardSection({
         filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
       });
       if (!path) return; // user cancelled the dialog
+      setExportProgress({ phase: "loading", current: 0, total: 0 });
+      setExportDialogOpen(true);
       setExporting(true);
+      unlisten = await listen<ExportProgress>(
+        "export-progress",
+        (e) => setExportProgress(e.payload),
+      );
       const generatedAt = `${date} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-      await invoke("export_history", { path, generatedAt });
+      const rows = await invoke<number>("export_history", { path, generatedAt });
+      setExportProgress((p) => ({
+        phase: "completed",
+        current: rows,
+        total: p.total || rows,
+      }));
       setExported(true);
-      setTimeout(() => setExported(false), 2000);
+      setTimeout(() => {
+        setExported(false);
+        setExportDialogOpen(false);
+      }, 2000);
     } catch (e) {
       setExportError(String(e));
+      setExportDialogOpen(false);
     } finally {
+      unlisten?.();
       setExporting(false);
     }
   }
@@ -138,16 +167,16 @@ export function DashboardSection({
             disabled={exporting}
           >
             {exporting ? (
-              <Loader2 className="animate-spin" />
+              <Loader2 data-icon="inline-start" className="animate-spin" />
             ) : exported ? (
-              <Check />
+              <Check data-icon="inline-start" />
             ) : (
-              <Download />
+              <Download data-icon="inline-start" />
             )}
             {exporting ? "Exporting…" : exported ? "Exported" : "Export XLSX"}
           </Button>
           <Button size="sm" onClick={openNew}>
-            <Plus />
+            <Plus data-icon="inline-start" />
             Add chart
           </Button>
         </div>
@@ -170,6 +199,11 @@ export function DashboardSection({
         game={game}
         editing={editing}
         onSave={onSaveChart}
+      />
+
+      <ExportProgressDialog
+        open={exportDialogOpen}
+        progress={exportProgress}
       />
 
       <AlertDialog
