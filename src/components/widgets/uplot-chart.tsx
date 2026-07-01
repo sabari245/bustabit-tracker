@@ -93,11 +93,13 @@ export function UplotChart({
   data,
   x,
   series,
+  numericX = false,
 }: {
   widget: ChartWidgetSpec;
   data: Row[];
   x: string;
   series: Series[];
+  numericX?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [themeTick, setThemeTick] = useState(0);
@@ -118,7 +120,9 @@ export function UplotChart({
     const css = (v: string) => resolveColor(el, v);
 
     const n = data.length;
-    const xs = data.map((_, i) => i);
+    const xs = numericX
+      ? data.map((r, i) => chartNumber(r[x]) ?? i)
+      : data.map((_, i) => i);
     const labels = data.map((r) => String(r[x] ?? ""));
     const colors = series.map((s) => css(s.color));
     const aligned: uPlot.AlignedData = [
@@ -143,6 +147,7 @@ export function UplotChart({
       });
 
     const labelStep = Math.max(1, Math.ceil(n / 12));
+    const xSplits = xs.filter((_, i) => i % labelStep === 0);
 
     const opts: uPlot.Options = {
       width: el.clientWidth || 300,
@@ -150,7 +155,15 @@ export function UplotChart({
       cursor: { x: true, y: false, points: { show: false } },
       legend: { show: false },
       scales: {
-        x: { time: false, range: isBar ? [-0.5, n - 0.5] : [0, Math.max(0, n - 1)] },
+        x: {
+          time: false,
+          range:
+            isBar
+              ? [-0.5, Math.max(0, n - 0.5)]
+              : numericX
+                ? [xs[0] ?? 0, xs[xs.length - 1] ?? 0]
+                : [0, Math.max(0, n - 1)],
+        },
         y: {
           range: widget.yDomain
             ? widget.yDomain
@@ -165,8 +178,11 @@ export function UplotChart({
           stroke: muted,
           grid: { show: false },
           ticks: { show: false },
-          splits: () => xs.filter((i) => i % labelStep === 0),
-          values: (_u, sp) => sp.map((i) => labels[i] ?? ""),
+          splits: () => xSplits,
+          values: (_u, sp) =>
+            numericX
+              ? sp.map((v) => Number(v).toLocaleString())
+              : sp.map((i) => labels[i] ?? ""),
           label: widget.xTitle,
           labelFont: FONT,
           labelSize: widget.xTitle ? 18 : undefined,
@@ -211,7 +227,7 @@ export function UplotChart({
       ro.disconnect();
       u.destroy();
     };
-  }, [widget, data, x, series, themeTick]);
+  }, [widget, data, x, series, numericX, themeTick]);
 
   return <div ref={ref} className="h-[300px] w-full" />;
 }

@@ -372,11 +372,11 @@ ${script}
     this.engineEvents.emit("GAME_STARTING");
     if (this.stopped) return;
 
-    this.gameState = "GAME_STARTED";
-    this.engineEvents.emit("GAME_STARTED");
     this.currentBet = this.queuedBet as Bet | null;
     this.queuedBet = null;
     const activeBet = this.currentBet;
+    this.gameState = "GAME_STARTED";
+    this.engineEvents.emit("GAME_STARTED");
 
     let cashedAt: number | null = null;
     let wager: number | null = null;

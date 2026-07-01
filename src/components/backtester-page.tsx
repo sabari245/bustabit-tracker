@@ -9,7 +9,6 @@ import {
   formatBits,
   parseBacktestDetail,
   type BacktestGame,
-  type BacktestResult,
 } from "@/lib/backtester";
 import type { ChartWidgetSpec } from "@/lib/dashboard-spec";
 import type { Row } from "@/lib/query";
@@ -25,6 +24,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  BacktestProgressDialog,
+  type BacktestProgress,
+} from "@/components/progress-dialog";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -78,14 +81,12 @@ type BacktestDetail = BacktestSummary & {
 const EQUITY_CHART: ChartWidgetSpec = {
   kind: "chart",
   type: "line",
-  title: "Backtest equity",
+  title: "Account balance",
   sql: "",
   x: "game",
-  yTitle: "bits",
-  series: [
-    { key: "profit", label: "Profit", color: "var(--chart-1)" },
-    { key: "balance", label: "Balance", color: "var(--chart-2)" },
-  ],
+  xTitle: "Game",
+  yTitle: "Balance (bits)",
+  series: [{ key: "balance", label: "Balance", color: "var(--chart-2)" }],
 };
 
 function formatSavedAt(value: string): string {
@@ -93,7 +94,7 @@ function formatSavedAt(value: string): string {
   return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
 }
 
-function SummaryGrid({ result }: { result: BacktestResult | BacktestDetail }) {
+function SummaryGrid({ result }: { result: BacktestDetail }) {
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Metric label="Games" value={result.games.toLocaleString()} />
@@ -117,29 +118,39 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function EquityChart({ resultJson }: { resultJson: string }) {
-  const detail = useMemo(() => parseBacktestDetail(resultJson), [resultJson]);
+function EquityChart({ result }: { result: BacktestDetail }) {
+  const detail = useMemo(() => parseBacktestDetail(result.resultJson), [result.resultJson]);
   const rows: Row[] = detail.balanceSeries.map((p) => ({
     game: p.gameId,
     balance: p.balance / 100,
-    profit: p.profit / 100,
   }));
+  const balanceSeries = EQUITY_CHART.series ?? [];
 
   return (
     <div className="flex flex-col gap-4">
-      <UplotChart widget={EQUITY_CHART} data={rows} x="game" series={EQUITY_CHART.series ?? []} />
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <span className="h-0.5 w-6 rounded-full bg-chart-2" />
+        <span>Balance</span>
+      </div>
+      <UplotChart
+        widget={EQUITY_CHART}
+        data={rows}
+        x="game"
+        series={balanceSeries}
+        numericX
+      />
       <div className="grid gap-3 sm:grid-cols-3">
         <Metric
-          label="Highest money"
-          value={`${formatBits(detail.peak.profit)} bits at #${detail.peak.gameId.toLocaleString()}`}
+          label="Highest balance"
+          value={`${formatBits(detail.peak.balance)} bits at #${detail.peak.gameId.toLocaleString()}`}
         />
         <Metric
-          label="Lowest money"
-          value={`${formatBits(detail.trough.profit)} bits at #${detail.trough.gameId.toLocaleString()}`}
+          label="Lowest balance"
+          value={`${formatBits(detail.trough.balance)} bits at #${detail.trough.gameId.toLocaleString()}`}
         />
         <Metric
-          label="Worst drawdown point"
-          value={`${formatBits(detail.maxDrawdownAt.profit)} bits at #${detail.maxDrawdownAt.gameId.toLocaleString()}`}
+          label="Max drawdown"
+          value={`${formatBits(result.maxDrawdown)} bits at #${detail.maxDrawdownAt.gameId.toLocaleString()}`}
         />
       </div>
     </div>
@@ -167,10 +178,12 @@ export function BacktesterPage() {
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
   const [rows, setRows] = useState<BacktestSummary[]>([]);
   const [selected, setSelected] = useState<BacktestDetail | null>(null);
-  const [latest, setLatest] = useState<BacktestResult | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [progress, setProgress] = useState<BacktestProgress>({
+    current: 0,
+    total: 0,
+  });
   const [error, setError] = useState<string | null>(null);
 
   async function refreshBacktests() {
@@ -193,9 +206,8 @@ export function BacktesterPage() {
 
   async function run() {
     setError(null);
-    setLatest(null);
     setSelected(null);
-    setProgress(0);
+    setProgress({ current: 0, total: cacheInfo?.count ?? 0 });
     setRunning(true);
     try {
       const info = await refreshCacheInfo();
@@ -209,6 +221,7 @@ export function BacktesterPage() {
         bitsToSats(Number(startingBits) || 0),
         info.count,
       );
+      setProgress({ current: 0, total: info.count });
 
       let afterGameId = 0;
       let loaded = 0;
@@ -221,14 +234,13 @@ export function BacktesterPage() {
         runner.process(batch);
         loaded += batch.length;
         afterGameId = batch[batch.length - 1].gameId;
-        setProgress(Math.min(loaded, info.count));
+        setProgress({ current: Math.min(loaded, info.count), total: info.count });
         if (runner.isStopped()) break;
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       }
 
       const result = runner.result();
       const id = await invoke<number>("save_backtest", { input: result });
-      setLatest(result);
       await refreshBacktests();
       await loadBacktest(id);
     } catch (e) {
@@ -261,13 +273,9 @@ export function BacktesterPage() {
     cacheInfo && cacheInfo.count > 0 && cacheInfo.minGameId != null && cacheInfo.maxGameId != null
       ? `${cacheInfo.count.toLocaleString()} cached games, #${cacheInfo.minGameId.toLocaleString()} to #${cacheInfo.maxGameId.toLocaleString()}`
       : "No cached games yet. Compute a tracker history first.";
-  const progressText =
-    cacheInfo && cacheInfo.count > 0
-      ? `${progress.toLocaleString()} / ${cacheInfo.count.toLocaleString()} games`
-      : "";
-
   return (
     <main className="flex flex-1 flex-col gap-4 p-4">
+      <BacktestProgressDialog open={running} progress={progress} />
       <Card>
         <CardHeader>
           <CardTitle>Autobet Backtester</CardTitle>
@@ -325,27 +333,11 @@ export function BacktesterPage() {
             </div>
             <div className="flex flex-col gap-1 text-sm text-muted-foreground">
               <p>{cacheText}</p>
-              {running && <p>{progressText}</p>}
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
           </form>
         </CardContent>
       </Card>
-
-      {latest && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Latest Run</CardTitle>
-            <CardDescription>
-              Auto-saved after games #{latest.startGameId.toLocaleString()} to #
-              {latest.endGameId.toLocaleString()}.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <SummaryGrid result={latest} />
-          </CardContent>
-        </Card>
-      )}
 
       <Card>
         <CardHeader>
@@ -425,7 +417,7 @@ export function BacktesterPage() {
                 <TabsTrigger value="script">Script</TabsTrigger>
               </TabsList>
               <TabsContent value="graph">
-                <EquityChart resultJson={selected.resultJson} />
+                <EquityChart result={selected} />
               </TabsContent>
               <TabsContent value="summary">
                 <SummaryGrid result={selected} />

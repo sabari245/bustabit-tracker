@@ -17,6 +17,11 @@ export type HistoryProgress = {
 
 export type ExportProgress = HistoryProgress;
 
+export type BacktestProgress = {
+  current: number;
+  total: number;
+};
+
 export function ProgressDialog({
   open,
   progress,
@@ -133,6 +138,51 @@ export function ExportProgressDialog({
               <span>{progress.total.toLocaleString()} rows ready to export</span>
             ) : (
               <span>Loading cached history…</span>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function BacktestProgressDialog({
+  open,
+  progress,
+}: {
+  open: boolean;
+  progress: BacktestProgress;
+}) {
+  const showBar = progress.total > 0;
+  const percent = showBar
+    ? Math.min(100, Math.round((progress.current / progress.total) * 100))
+    : 0;
+
+  return (
+    <Dialog open={open} onOpenChange={() => {}}>
+      <DialogContent
+        showCloseButton={false}
+        onInteractOutside={(e) => e.preventDefault()}
+        onEscapeKeyDown={(e) => e.preventDefault()}
+      >
+        <DialogHeader>
+          <DialogTitle>Running backtest</DialogTitle>
+          <DialogDescription>
+            Replaying cached games through the selected autobet strategy.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-3 py-2">
+          <Progress value={showBar ? percent : null} />
+          <div className="flex items-center gap-2 text-sm text-muted-foreground tabular-nums">
+            <Loader2 className="animate-spin" />
+            {showBar ? (
+              <span>
+                {progress.current.toLocaleString()} /{" "}
+                {progress.total.toLocaleString()} games ({percent}%)
+              </span>
+            ) : (
+              <span>Preparing cached games…</span>
             )}
           </div>
         </div>

@@ -11,7 +11,7 @@ export function Navbar({
   onPageChange: (page: AppPage) => void;
 }) {
   return (
-    <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+    <header className="sticky top-0 z-50 w-full border-b border-border/60 bg-card/80 shadow-sm backdrop-blur-xl backdrop-saturate-150 supports-[backdrop-filter]:bg-card/65">
       <div className="flex h-14 items-center justify-between px-4">
         <div className="flex items-center gap-3">
           <span className="font-bold">bustabit tracker</span>
