@@ -91,7 +91,47 @@ const RUNS = `
 const RED_HIST = `${RUNS},
   rs AS (SELECT len AS length, COUNT(*) AS count FROM runs WHERE green = 0 GROUP BY len)`;
 
+// Exact green-streak length histogram, built on top of RUNS.
+const GREEN_HIST = `${RUNS},
+  gs AS (SELECT len AS length, COUNT(*) AS count FROM runs WHERE green = 1 GROUP BY len)`;
+
+// Shared CTE: collapse maximal alternating-colour games into runs. A run starts
+// whenever the current colour matches the previous colour; otherwise it extends
+// the current R-G-R-G... / G-R-G-R... run.
+const ALT_RUNS = `
+  WITH ordered AS (
+    SELECT game_id, is_green AS green,
+           LAG(is_green) OVER (ORDER BY game_id) AS prev_green
+    FROM games WHERE game_id <= ?1
+  ),
+  marked AS (
+    SELECT game_id, green,
+           CASE WHEN prev_green IS NULL OR green = prev_green THEN 1 ELSE 0 END AS starts
+    FROM ordered
+  ),
+  grp AS (
+    SELECT game_id, green,
+           SUM(starts) OVER (ORDER BY game_id ROWS UNBOUNDED PRECEDING) AS island
+    FROM marked
+  ),
+  alt_runs AS (
+    SELECT island, COUNT(*) AS len, MIN(game_id) AS lo, MAX(game_id) AS hi
+    FROM grp GROUP BY island
+  ),
+  runs AS (
+    SELECT a.len, a.hi, g.green AS start_green
+    FROM alt_runs a
+    JOIN grp g ON g.island = a.island AND g.game_id = a.lo
+  )`;
+
+const RED_ALT_HIST = `${ALT_RUNS},
+  ars AS (SELECT len AS length, COUNT(*) AS count FROM runs WHERE start_green = 0 AND len >= 2 GROUP BY len)`;
+
+const GREEN_ALT_HIST = `${ALT_RUNS},
+  ags AS (SELECT len AS length, COUNT(*) AS count FROM runs WHERE start_green = 1 AND len >= 2 GROUP BY len)`;
+
 const RED = "var(--destructive)";
+const GREEN = "var(--chart-2)";
 
 export const DASHBOARD: DashboardSpec = {
   rows: [
@@ -163,7 +203,6 @@ export const DASHBOARD: DashboardSpec = {
       ],
     },
     {
-      // Two half-width charts, side by side (fold to stacked on narrow windows).
       widgets: [
         {
           kind: "chart",
@@ -188,33 +227,6 @@ export const DASHBOARD: DashboardSpec = {
                   UNION ALL SELECT '10–100×', 3, b3 FROM d
                   UNION ALL SELECT '≥100×', 4, b4 FROM d
                 ) ORDER BY ord`,
-        },
-        {
-          kind: "chart",
-          type: "bar",
-          title: "Streak lengths",
-          description: "Number of green vs red runs by length",
-          x: "label",
-          series: [
-            { key: "green", label: "Green runs", color: "var(--chart-2)" },
-            { key: "red", label: "Red runs", color: RED },
-          ],
-          sql: `${RUNS},
-                labeled AS (
-                  SELECT green, CASE
-                    WHEN len BETWEEN 6 AND 10 THEN 6
-                    WHEN len BETWEEN 11 AND 20 THEN 7
-                    WHEN len >= 21 THEN 8 ELSE len END AS ord
-                  FROM runs
-                ),
-                buckets(label, ord) AS (
-                  VALUES ('1',1),('2',2),('3',3),('4',4),('5',5),('6–10',6),('11–20',7),('21+',8)
-                )
-                SELECT b.label AS label,
-                  COALESCE(SUM(CASE WHEN l.green = 1 THEN 1 END), 0) AS green,
-                  COALESCE(SUM(CASE WHEN l.green = 0 THEN 1 END), 0) AS red
-                FROM buckets b LEFT JOIN labeled l ON l.ord = b.ord
-                GROUP BY b.ord, b.label ORDER BY b.ord`,
         },
       ],
     },
@@ -273,6 +285,198 @@ export const DASHBOARD: DashboardSpec = {
                 series: [{ key: "pct", label: "Continued to next", color: RED }],
                 sql: `${RED_HIST},
                       s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM rs)
+                      SELECT length,
+                             ROUND(100.0 * COALESCE(LEAD(atleast) OVER (ORDER BY length), 0) / atleast, 2) AS pct
+                      FROM s ORDER BY length`,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      // Dedicated green-streak analysis, mirroring the red-streak views.
+      widgets: [
+        {
+          kind: "tabs",
+          title: "Green streaks",
+          description: "Runs of consecutive games at or above 2×",
+          tabs: [
+            {
+              value: "frequency",
+              label: "Frequency",
+              chart: {
+                kind: "chart",
+                type: "bar",
+                title: "Frequency",
+                note: "How many green streaks were exactly this many games long.",
+                x: "length",
+                series: [{ key: "count", label: "Green streaks", color: GREEN }],
+                sql: `${GREEN_HIST} SELECT length, count FROM gs ORDER BY length`,
+              },
+            },
+            {
+              value: "survival",
+              label: "Survival",
+              chart: {
+                kind: "chart",
+                type: "area",
+                title: "Survival",
+                note: "Of all green streaks, the % that reached at least this length.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                series: [{ key: "pct", label: "Reached ≥ length", color: GREEN }],
+                sql: `${GREEN_HIST},
+                      tot AS (SELECT SUM(count) AS s FROM gs)
+                      SELECT length,
+                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
+                      FROM gs ORDER BY length`,
+              },
+            },
+            {
+              value: "continuation",
+              label: "Continuation",
+              chart: {
+                kind: "chart",
+                type: "line",
+                title: "Continuation",
+                note: "Given a streak already reached length N, how often the next game was also green. Roughly flat ≈ the base green rate if rounds are independent.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                refLine: 50,
+                series: [{ key: "pct", label: "Continued to next", color: GREEN }],
+                sql: `${GREEN_HIST},
+                      s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM gs)
+                      SELECT length,
+                             ROUND(100.0 * COALESCE(LEAD(atleast) OVER (ORDER BY length), 0) / atleast, 2) AS pct
+                      FROM s ORDER BY length`,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      // Alternating R-G-R-G... runs, three views in tabs.
+      widgets: [
+        {
+          kind: "tabs",
+          title: "Alternating streaks (red start)",
+          description: "Runs that alternate below 2×, at least 2×, below 2×...",
+          tabs: [
+            {
+              value: "frequency",
+              label: "Frequency",
+              chart: {
+                kind: "chart",
+                type: "bar",
+                title: "Frequency",
+                note: "How many alternating streaks started red and were exactly this many games long.",
+                x: "length",
+                series: [{ key: "count", label: "Red-start alternations", color: RED }],
+                sql: `${RED_ALT_HIST} SELECT length, count FROM ars ORDER BY length`,
+              },
+            },
+            {
+              value: "survival",
+              label: "Survival",
+              chart: {
+                kind: "chart",
+                type: "area",
+                title: "Survival",
+                note: "Of all red-start alternating streaks, the % that reached at least this length.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                series: [{ key: "pct", label: "Reached ≥ length", color: RED }],
+                sql: `${RED_ALT_HIST},
+                      tot AS (SELECT SUM(count) AS s FROM ars)
+                      SELECT length,
+                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
+                      FROM ars ORDER BY length`,
+              },
+            },
+            {
+              value: "continuation",
+              label: "Continuation",
+              chart: {
+                kind: "chart",
+                type: "line",
+                title: "Continuation",
+                note: "Given a red-start alternating streak already reached length N, how often the next game kept alternating.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                refLine: 50,
+                series: [{ key: "pct", label: "Continued to next", color: RED }],
+                sql: `${RED_ALT_HIST},
+                      s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM ars)
+                      SELECT length,
+                             ROUND(100.0 * COALESCE(LEAD(atleast) OVER (ORDER BY length), 0) / atleast, 2) AS pct
+                      FROM s ORDER BY length`,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
+      // Alternating G-R-G-R... runs, three views in tabs.
+      widgets: [
+        {
+          kind: "tabs",
+          title: "Alternating streaks (green start)",
+          description: "Runs that alternate at least 2×, below 2×, at least 2×...",
+          tabs: [
+            {
+              value: "frequency",
+              label: "Frequency",
+              chart: {
+                kind: "chart",
+                type: "bar",
+                title: "Frequency",
+                note: "How many alternating streaks started green and were exactly this many games long.",
+                x: "length",
+                series: [{ key: "count", label: "Green-start alternations", color: GREEN }],
+                sql: `${GREEN_ALT_HIST} SELECT length, count FROM ags ORDER BY length`,
+              },
+            },
+            {
+              value: "survival",
+              label: "Survival",
+              chart: {
+                kind: "chart",
+                type: "area",
+                title: "Survival",
+                note: "Of all green-start alternating streaks, the % that reached at least this length.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                series: [{ key: "pct", label: "Reached ≥ length", color: GREEN }],
+                sql: `${GREEN_ALT_HIST},
+                      tot AS (SELECT SUM(count) AS s FROM ags)
+                      SELECT length,
+                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
+                      FROM ags ORDER BY length`,
+              },
+            },
+            {
+              value: "continuation",
+              label: "Continuation",
+              chart: {
+                kind: "chart",
+                type: "line",
+                title: "Continuation",
+                note: "Given a green-start alternating streak already reached length N, how often the next game kept alternating.",
+                x: "length",
+                yUnit: "%",
+                yDomain: [0, 100],
+                refLine: 50,
+                series: [{ key: "pct", label: "Continued to next", color: GREEN }],
+                sql: `${GREEN_ALT_HIST},
+                      s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM ags)
                       SELECT length,
                              ROUND(100.0 * COALESCE(LEAD(atleast) OVER (ORDER BY length), 0) / atleast, 2) AS pct
                       FROM s ORDER BY length`,

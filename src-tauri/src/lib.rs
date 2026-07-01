@@ -88,8 +88,8 @@ fn compute_bust(game_hash: &str) -> Result<f64, String> {
 /// is exactly what we persist in the cache.
 fn bust_centi_of_bytes(message: &[u8]) -> i64 {
     // HMAC-SHA256, key = GAME_SALT (hex string as UTF-8 bytes), message = raw bytes.
-    let mut mac =
-        HmacSha256::new_from_slice(BUSTABIT_GAME_SALT.as_bytes()).expect("HMAC accepts any key len");
+    let mut mac = HmacSha256::new_from_slice(BUSTABIT_GAME_SALT.as_bytes())
+        .expect("HMAC accepts any key len");
     mac.update(message);
     let digest = mac.finalize().into_bytes();
 
@@ -134,6 +134,17 @@ struct Prepared {
     results: BTreeMap<String, Vec<serde_json::Map<String, Json>>>,
 }
 
+/// Persisted history state used to restore the dashboard on app startup.
+#[derive(Serialize)]
+struct HistoryState {
+    last_hash: String,
+    last_game_id: u64,
+    last_computed_at: String,
+    highest_hash: String,
+    highest_game_id: u64,
+    highest_computed_at: String,
+}
+
 /// Resolve (and create) the on-disk cache path: `<app data dir>/history.db`.
 fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -157,6 +168,7 @@ async fn compute_history(
     app: tauri::AppHandle,
     game_hash: String,
     queries: Vec<PrecomputeQuery>,
+    computed_at: Option<String>,
 ) -> Result<Prepared, String> {
     let db_path = db_path(&app)?;
     let app = app.clone();
@@ -184,7 +196,9 @@ async fn compute_history(
                 .build()
                 .await
                 .map_err(|e| format!("couldn't open cache db: {e}"))?;
-            let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+            let conn = db
+                .connect()
+                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
             ensure_schema(&conn).await?;
             run_history(
                 &conn,
@@ -194,6 +208,7 @@ async fn compute_history(
                 CLASSIC_START,
                 MAX_WALK,
                 &queries,
+                computed_at.as_deref(),
                 &report,
             )
             .await
@@ -230,7 +245,9 @@ async fn run_query(
                 .build()
                 .await
                 .map_err(|e| format!("couldn't open cache db: {e}"))?;
-            let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+            let conn = db
+                .connect()
+                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
             // Wait (up to 5s) for a competing writer's lock to clear instead of
             // failing instantly with "database is locked" when adding a chart races
             // a layout save or a sibling widget's cache write.
@@ -272,6 +289,15 @@ async fn run_query(
     .map_err(|e| format!("query failed to run: {e}"))?
 }
 
+/// Load the last/highest analysed game metadata. The frontend uses the highest
+/// stored hash to hydrate the dashboard on startup without asking the user to
+/// paste the hash again.
+#[tauri::command]
+async fn load_history_state(app: tauri::AppHandle) -> Result<Option<HistoryState>, String> {
+    let conn = open_db_conn(&app).await?;
+    read_history_state(&conn).await
+}
+
 /// Open the cache db and ensure the schema exists. Used by the lightweight
 /// layout commands (no heavy CPU, so they run directly on the async runtime).
 async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, String> {
@@ -280,7 +306,9 @@ async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, Stri
         .build()
         .await
         .map_err(|e| format!("couldn't open cache db: {e}"))?;
-    let conn = db.connect().map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+    let conn = db
+        .connect()
+        .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
     ensure_schema(&conn).await?;
     Ok(conn)
 }
@@ -294,8 +322,14 @@ async fn load_layout(app: tauri::AppHandle) -> Result<Option<String>, String> {
         .query("SELECT spec FROM layout WHERE id = 1", ())
         .await
         .map_err(|e| format!("couldn't load layout: {e}"))?;
-    match rows.next().await.map_err(|e| format!("couldn't load layout: {e}"))? {
-        Some(r) => Ok(Some(r.get(0).map_err(|e| format!("couldn't read layout: {e}"))?)),
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't load layout: {e}"))?
+    {
+        Some(r) => Ok(Some(
+            r.get(0).map_err(|e| format!("couldn't read layout: {e}"))?,
+        )),
         None => Ok(None),
     }
 }
@@ -360,7 +394,11 @@ async fn query_rows(
         .map_err(|e| format!("query failed: {e}"))?;
 
     let mut out = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|e| format!("query failed: {e}"))? {
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| format!("query failed: {e}"))?
+    {
         let mut obj = serde_json::Map::new();
         let cols = row.column_count();
         for i in 0..cols {
@@ -376,6 +414,19 @@ async fn query_rows(
     Ok(out)
 }
 
+/// The cache identity for a whole dashboard graph payload. Query ids are part of
+/// the key because they decide where result rows land in the client-side graph.
+fn graph_cache_key(queries: &[PrecomputeQuery]) -> String {
+    let mut h = Sha256::new();
+    for q in queries {
+        h.update(q.id.as_bytes());
+        h.update([0u8]);
+        h.update(q.sql.as_bytes());
+        h.update([0u8]);
+    }
+    hex::encode(h.finalize())
+}
+
 /// The cache identity for a query: `sha256(sql + NUL + params-json)`, hex-encoded.
 /// Including the bound params means a different game number (or any other bound
 /// value) maps to a distinct entry, and editing a chart's SQL never collides with
@@ -388,20 +439,103 @@ fn query_cache_key(sql: &str, params: &[Json]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Look up the full graph/dashboard result for an exact input hash + graph spec.
+async fn graph_cache_get(
+    conn: &libsql::Connection,
+    input_hash: &str,
+    graph_key: &str,
+) -> Result<Option<Prepared>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT from_game, to_game, total_games, result\n\
+             FROM graph_cache WHERE input_hash = ?1 AND graph_key = ?2",
+            libsql::params![input_hash, graph_key],
+        )
+        .await
+        .map_err(|e| format!("graph cache read failed: {e}"))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("graph cache read failed: {e}"))?
+    {
+        Some(r) => {
+            let from_game: i64 = r
+                .get(0)
+                .map_err(|e| format!("graph cache read failed: {e}"))?;
+            let to_game: i64 = r
+                .get(1)
+                .map_err(|e| format!("graph cache read failed: {e}"))?;
+            let total_games: i64 = r
+                .get(2)
+                .map_err(|e| format!("graph cache read failed: {e}"))?;
+            let s: String = r
+                .get(3)
+                .map_err(|e| format!("graph cache read failed: {e}"))?;
+            let results =
+                serde_json::from_str(&s).map_err(|e| format!("corrupt graph cache entry: {e}"))?;
+            Ok(Some(Prepared {
+                from_game: from_game as u64,
+                to_game: to_game as u64,
+                total_games: total_games as u64,
+                results,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Persist the full graph/dashboard result for an exact input hash + graph spec.
+async fn graph_cache_put(
+    conn: &libsql::Connection,
+    input_hash: &str,
+    graph_key: &str,
+    prepared: &Prepared,
+) -> Result<(), String> {
+    let s = serde_json::to_string(&prepared.results)
+        .map_err(|e| format!("graph cache encode failed: {e}"))?;
+    conn.execute(
+        "INSERT INTO graph_cache(input_hash, graph_key, from_game, to_game, total_games, result)\n\
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n\
+         ON CONFLICT(input_hash, graph_key) DO UPDATE SET\n\
+             from_game = excluded.from_game,\n\
+             to_game = excluded.to_game,\n\
+             total_games = excluded.total_games,\n\
+             result = excluded.result",
+        libsql::params![
+            input_hash,
+            graph_key,
+            prepared.from_game as i64,
+            prepared.to_game as i64,
+            prepared.total_games as i64,
+            s
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("graph cache write failed: {e}"))
+}
+
 /// Look up a previously cached result for `key`, deserializing the stored JSON.
 async fn cache_get(
     conn: &libsql::Connection,
     key: &str,
 ) -> Result<Option<Vec<serde_json::Map<String, Json>>>, String> {
     let mut rows = conn
-        .query("SELECT result FROM query_cache WHERE cache_key = ?1", libsql::params![key])
+        .query(
+            "SELECT result FROM query_cache WHERE cache_key = ?1",
+            libsql::params![key],
+        )
         .await
         .map_err(|e| format!("cache read failed: {e}"))?;
-    match rows.next().await.map_err(|e| format!("cache read failed: {e}"))? {
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("cache read failed: {e}"))?
+    {
         Some(r) => {
             let s: String = r.get(0).map_err(|e| format!("cache read failed: {e}"))?;
-            let parsed = serde_json::from_str(&s)
-                .map_err(|e| format!("corrupt cache entry: {e}"))?;
+            let parsed =
+                serde_json::from_str(&s).map_err(|e| format!("corrupt cache entry: {e}"))?;
             Ok(Some(parsed))
         }
         None => Ok(None),
@@ -463,6 +597,15 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
          CREATE TABLE IF NOT EXISTS layout (\n\
              id   INTEGER PRIMARY KEY CHECK (id = 1),\n\
              spec TEXT NOT NULL\n\
+         );\n\
+         CREATE TABLE IF NOT EXISTS history_state (\n\
+             id                  INTEGER PRIMARY KEY CHECK (id = 1),\n\
+             last_hash           TEXT    NOT NULL,\n\
+             last_game_id        INTEGER NOT NULL,\n\
+             last_computed_at    TEXT    NOT NULL,\n\
+             highest_hash        TEXT    NOT NULL,\n\
+             highest_game_id     INTEGER NOT NULL,\n\
+             highest_computed_at TEXT    NOT NULL\n\
          );",
     )
     .await
@@ -471,9 +614,12 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
     // Migrate caches created before the is_green column existed: add it and
     // backfill from bust_centi (the green boundary is 2.00× == 200 centi).
     if !column_exists(conn, "games", "is_green").await? {
-        conn.execute("ALTER TABLE games ADD COLUMN is_green INTEGER NOT NULL DEFAULT 0", ())
-            .await
-            .map_err(|e| format!("schema migration failed: {e}"))?;
+        conn.execute(
+            "ALTER TABLE games ADD COLUMN is_green INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await
+        .map_err(|e| format!("schema migration failed: {e}"))?;
         conn.execute("UPDATE games SET is_green = (bust_centi >= 200)", ())
             .await
             .map_err(|e| format!("schema migration failed: {e}"))?;
@@ -499,12 +645,20 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
 /// forever — no invalidation needed. A newer hash yields a higher game number
 /// (different params → new key); an edited chart yields different SQL (new key).
 async fn ensure_cache_table(conn: &libsql::Connection) -> Result<(), String> {
-    conn.execute(
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS query_cache (\n\
              cache_key TEXT PRIMARY KEY,\n\
              result    TEXT NOT NULL\n\
-         )",
-        (),
+         );\n\
+         CREATE TABLE IF NOT EXISTS graph_cache (\n\
+             input_hash  TEXT NOT NULL,\n\
+             graph_key   TEXT NOT NULL,\n\
+             from_game   INTEGER NOT NULL,\n\
+             to_game     INTEGER NOT NULL,\n\
+             total_games INTEGER NOT NULL,\n\
+             result      TEXT NOT NULL,\n\
+             PRIMARY KEY (input_hash, graph_key)\n\
+         );",
     )
     .await
     .map(|_| ())
@@ -518,7 +672,11 @@ async fn column_exists(conn: &libsql::Connection, table: &str, col: &str) -> Res
         .query(&format!("PRAGMA table_info({table})"), ())
         .await
         .map_err(|e| format!("schema check failed: {e}"))?;
-    while let Some(r) = rows.next().await.map_err(|e| format!("schema check failed: {e}"))? {
+    while let Some(r) = rows
+        .next()
+        .await
+        .map_err(|e| format!("schema check failed: {e}"))?
+    {
         let name: String = r.get(1).map_err(|e| format!("schema check failed: {e}"))?;
         if name == col {
             return Ok(true);
@@ -527,13 +685,100 @@ async fn column_exists(conn: &libsql::Connection, table: &str, col: &str) -> Res
     Ok(false)
 }
 
+/// Load the persisted history state, if the user has analysed at least one hash.
+async fn read_history_state(conn: &libsql::Connection) -> Result<Option<HistoryState>, String> {
+    let mut rows = conn
+        .query(
+            "SELECT last_hash, last_game_id, last_computed_at,\n\
+                    highest_hash, highest_game_id, highest_computed_at\n\
+             FROM history_state WHERE id = 1",
+            (),
+        )
+        .await
+        .map_err(|e| format!("history state read failed: {e}"))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("history state read failed: {e}"))?
+    {
+        Some(r) => {
+            let last_game_id: i64 = r
+                .get(1)
+                .map_err(|e| format!("history state read failed: {e}"))?;
+            let highest_game_id: i64 = r
+                .get(4)
+                .map_err(|e| format!("history state read failed: {e}"))?;
+            Ok(Some(HistoryState {
+                last_hash: r
+                    .get(0)
+                    .map_err(|e| format!("history state read failed: {e}"))?,
+                last_game_id: last_game_id as u64,
+                last_computed_at: r
+                    .get(2)
+                    .map_err(|e| format!("history state read failed: {e}"))?,
+                highest_hash: r
+                    .get(3)
+                    .map_err(|e| format!("history state read failed: {e}"))?,
+                highest_game_id: highest_game_id as u64,
+                highest_computed_at: r
+                    .get(5)
+                    .map_err(|e| format!("history state read failed: {e}"))?,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Remember an explicit user-submitted hash and keep the highest analysed game
+/// separately so startup can restore the broadest cached dashboard.
+async fn remember_history(
+    conn: &libsql::Connection,
+    game_hash: &str,
+    game_id: u64,
+    computed_at: Option<&str>,
+) -> Result<(), String> {
+    let Some(computed_at) = computed_at else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO history_state(\n\
+             id, last_hash, last_game_id, last_computed_at,\n\
+             highest_hash, highest_game_id, highest_computed_at\n\
+         ) VALUES (1, ?1, ?2, ?3, ?1, ?2, ?3)\n\
+         ON CONFLICT(id) DO UPDATE SET\n\
+             last_hash = excluded.last_hash,\n\
+             last_game_id = excluded.last_game_id,\n\
+             last_computed_at = excluded.last_computed_at,\n\
+             highest_hash = CASE\n\
+                 WHEN excluded.last_game_id >= history_state.highest_game_id\n\
+                 THEN excluded.last_hash ELSE history_state.highest_hash END,\n\
+             highest_game_id = CASE\n\
+                 WHEN excluded.last_game_id >= history_state.highest_game_id\n\
+                 THEN excluded.last_game_id ELSE history_state.highest_game_id END,\n\
+             highest_computed_at = CASE\n\
+                 WHEN excluded.last_game_id >= history_state.highest_game_id\n\
+                 THEN excluded.last_computed_at ELSE history_state.highest_computed_at END",
+        libsql::params![game_hash, game_id as i64, computed_at],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("history state write failed: {e}"))
+}
+
 /// The game number for a hash we've already cached, if any.
 async fn lookup_hash(conn: &libsql::Connection, hash_hex: &str) -> Result<Option<u64>, String> {
     let mut rows = conn
-        .query("SELECT game_id FROM games WHERE hash = ?1", libsql::params![hash_hex])
+        .query(
+            "SELECT game_id FROM games WHERE hash = ?1",
+            libsql::params![hash_hex],
+        )
         .await
         .map_err(|e| format!("hash lookup failed: {e}"))?;
-    match rows.next().await.map_err(|e| format!("hash lookup failed: {e}"))? {
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("hash lookup failed: {e}"))?
+    {
         Some(r) => {
             let id: i64 = r.get(0).map_err(|e| format!("hash lookup failed: {e}"))?;
             Ok(Some(id as u64))
@@ -547,10 +792,17 @@ async fn lookup_hash(conn: &libsql::Connection, hash_hex: &str) -> Result<Option
 /// only stored hash a newer lookup can encounter first when walking down.
 async fn stored_max(conn: &libsql::Connection) -> Result<Option<(u64, Vec<u8>)>, String> {
     let mut rows = conn
-        .query("SELECT game_id, hash FROM games ORDER BY game_id DESC LIMIT 1", ())
+        .query(
+            "SELECT game_id, hash FROM games ORDER BY game_id DESC LIMIT 1",
+            (),
+        )
         .await
         .map_err(|e| format!("cache read failed: {e}"))?;
-    match rows.next().await.map_err(|e| format!("cache read failed: {e}"))? {
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("cache read failed: {e}"))?
+    {
         Some(r) => {
             let id: i64 = r.get(0).map_err(|e| format!("cache read failed: {e}"))?;
             let h: String = r.get(1).map_err(|e| format!("cache read failed: {e}"))?;
@@ -679,22 +931,37 @@ async fn run_history(
     classic_start: u64,
     max_walk: u64,
     queries: &[PrecomputeQuery],
+    computed_at: Option<&str>,
     report: &dyn Fn(&str, u64, u64),
 ) -> Result<Prepared, String> {
     let game_hash = game_hash.trim();
     if game_hash.len() != 64 || !game_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("game_hash must be a 64-character hex string".to_string());
     }
-    let start = hex::decode(game_hash).map_err(|e| format!("failed to decode hash: {e}"))?;
+    let game_hash = game_hash.to_ascii_lowercase();
+    let start = hex::decode(&game_hash).map_err(|e| format!("failed to decode hash: {e}"))?;
     let inception = hex::decode(inception_hex).map_err(|e| format!("bad inception hash: {e}"))?;
+    let graph_key = graph_cache_key(queries);
+
+    if let Some(hit) = graph_cache_get(conn, &game_hash, &graph_key).await? {
+        remember_history(conn, &game_hash, hit.from_game, computed_at).await?;
+        return Ok(hit);
+    }
 
     report("locating", 0, 0);
     let stored = stored_max(conn).await?;
 
     // Fast path: the hash is already cached, so its number is known directly.
-    let game_number = match lookup_hash(conn, game_hash).await? {
+    let game_number = match lookup_hash(conn, &game_hash).await? {
         Some(n) => n,
-        None => locate_game(&start, stored.clone(), &inception, chain_offset, max_walk, report)?,
+        None => locate_game(
+            &start,
+            stored.clone(),
+            &inception,
+            chain_offset,
+            max_walk,
+            report,
+        )?,
     };
 
     if game_number < classic_start {
@@ -726,12 +993,15 @@ async fn run_history(
     }
     report("aggregating", total_queries, total_queries);
 
-    Ok(Prepared {
+    let prepared = Prepared {
         from_game: game_number,
         to_game: classic_start,
         total_games: game_number - classic_start + 1,
         results,
-    })
+    };
+    graph_cache_put(conn, &game_hash, &graph_key, &prepared).await?;
+    remember_history(conn, &game_hash, prepared.from_game, computed_at).await?;
+    Ok(prepared)
 }
 
 #[tauri::command]
@@ -871,10 +1141,15 @@ async fn export_history(
                     .await
                     .map_err(|e| format!("export query failed: {e}"))?;
 
-                while let Some(r) = rows.next().await.map_err(|e| format!("export read failed: {e}"))? {
+                while let Some(r) = rows
+                    .next()
+                    .await
+                    .map_err(|e| format!("export read failed: {e}"))?
+                {
                     let gid: i64 = r.get(0).map_err(|e| format!("export read failed: {e}"))?;
                     let hash: String = r.get(1).map_err(|e| format!("export read failed: {e}"))?;
-                    let bust_centi: i64 = r.get(2).map_err(|e| format!("export read failed: {e}"))?;
+                    let bust_centi: i64 =
+                        r.get(2).map_err(|e| format!("export read failed: {e}"))?;
                     let is_green: i64 = r.get(3).map_err(|e| format!("export read failed: {e}"))?;
 
                     sheet
@@ -921,6 +1196,7 @@ pub fn run() {
             bust_from_hash,
             compute_history,
             run_query,
+            load_history_state,
             load_layout,
             save_layout,
             export_history
@@ -936,7 +1212,8 @@ mod tests {
     #[test]
     fn current_classic_game() {
         // df5d54b8… is a current-era classic game; site shows 38.65x.
-        let b = compute_bust("df5d54b8ca42cb40ea80e8ba74b3281f7b9d49bc27fecbe104847de1e91e4929").unwrap();
+        let b = compute_bust("df5d54b8ca42cb40ea80e8ba74b3281f7b9d49bc27fecbe104847de1e91e4929")
+            .unwrap();
         assert!((b - 38.65).abs() < 1e-9, "got {b}");
     }
 
@@ -958,7 +1235,10 @@ mod tests {
     const START: &str = "df5d54b8ca42cb40ea80e8ba74b3281f7b9d49bc27fecbe104847de1e91e4929";
 
     async fn mem_conn() -> libsql::Connection {
-        let db = libsql::Builder::new_local(":memory:").build().await.unwrap();
+        let db = libsql::Builder::new_local(":memory:")
+            .build()
+            .await
+            .unwrap();
         let conn = db.connect().unwrap();
         ensure_schema(&conn).await.unwrap();
         conn
@@ -985,6 +1265,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1015,6 +1296,7 @@ mod tests {
             1_000,
             50,
             &[],
+            None,
             &|_, _, _| {}
         )
         .await
@@ -1034,6 +1316,7 @@ mod tests {
             1_000_000,
             50,
             &[],
+            None,
             &|_, _, _| {}
         )
         .await
@@ -1051,7 +1334,8 @@ mod tests {
         let offset = classic_start - 5; // game_number(START) = classic_start + 5
 
         let count_sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
-        let green_sql = "SELECT COALESCE(SUM(bust_centi >= 200),0) AS c FROM games WHERE game_id <= ?1";
+        let green_sql =
+            "SELECT COALESCE(SUM(bust_centi >= 200),0) AS c FROM games WHERE game_id <= ?1";
 
         // Cold, single-shot computation of the full range.
         let cold = mem_conn().await;
@@ -1063,6 +1347,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1082,6 +1367,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1095,6 +1381,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1120,6 +1407,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1134,6 +1422,7 @@ mod tests {
             classic_start,
             0,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1155,6 +1444,7 @@ mod tests {
             classic_start,
             100,
             &[],
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1184,8 +1474,7 @@ mod tests {
         let offset = classic_start - 5;
 
         let count_sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
-        let max_sql =
-            "SELECT MAX(bust_centi) / 100.0 AS c FROM games WHERE game_id <= ?1";
+        let max_sql = "SELECT MAX(bust_centi) / 100.0 AS c FROM games WHERE game_id <= ?1";
         let queries = vec![
             PrecomputeQuery {
                 id: "count".to_string(),
@@ -1205,6 +1494,7 @@ mod tests {
             classic_start,
             100,
             &queries,
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1213,8 +1503,7 @@ mod tests {
         assert_eq!(p.results.len(), 2);
         let g = Json::from(p.from_game);
         let on_demand_count = scalar(&conn, count_sql, vec![g.clone()]).await;
-        let on_demand_rows =
-            query_rows(&conn, max_sql, vec![g]).await.unwrap();
+        let on_demand_rows = query_rows(&conn, max_sql, vec![g]).await.unwrap();
         let on_demand_max = on_demand_rows[0]["c"].as_f64().unwrap();
         assert_eq!(
             p.results["count"][0]["c"].as_i64().unwrap(),
@@ -1249,6 +1538,7 @@ mod tests {
             classic_start,
             100,
             &queries,
+            None,
             &|_, _, _| {},
         )
         .await
@@ -1264,17 +1554,46 @@ mod tests {
         let upsert = "INSERT INTO layout(id, spec) VALUES (1, ?1)\n\
                       ON CONFLICT(id) DO UPDATE SET spec = excluded.spec";
 
-        conn.execute(upsert, libsql::params!["{\"rows\":[]}"]).await.unwrap();
+        conn.execute(upsert, libsql::params!["{\"rows\":[]}"])
+            .await
+            .unwrap();
         conn.execute(upsert, libsql::params!["{\"rows\":[{\"widgets\":[]}]}"])
             .await
             .unwrap();
 
         // Always exactly one row; the latest spec wins.
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM layout", vec![]).await, 1);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) AS c FROM layout", vec![]).await,
+            1
+        );
         let rows = query_rows(&conn, "SELECT spec FROM layout WHERE id = 1", vec![])
             .await
             .unwrap();
-        assert_eq!(rows[0]["spec"].as_str().unwrap(), "{\"rows\":[{\"widgets\":[]}]}");
+        assert_eq!(
+            rows[0]["spec"].as_str().unwrap(),
+            "{\"rows\":[{\"widgets\":[]}]}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_state_tracks_last_and_highest_games() {
+        let conn = mem_conn().await;
+        let older_hash = synthetic_inception(START, 4);
+
+        remember_history(&conn, START, 1_005, Some("2026-07-01T10:00:00.000Z"))
+            .await
+            .unwrap();
+        remember_history(&conn, &older_hash, 1_001, Some("2026-07-01T11:00:00.000Z"))
+            .await
+            .unwrap();
+
+        let state = read_history_state(&conn).await.unwrap().unwrap();
+        assert_eq!(state.last_hash, older_hash);
+        assert_eq!(state.last_game_id, 1_001);
+        assert_eq!(state.last_computed_at, "2026-07-01T11:00:00.000Z");
+        assert_eq!(state.highest_hash, START);
+        assert_eq!(state.highest_game_id, 1_005);
+        assert_eq!(state.highest_computed_at, "2026-07-01T10:00:00.000Z");
     }
 
     #[tokio::test]
@@ -1314,7 +1633,9 @@ mod tests {
         let conn = mem_conn().await;
         for (g, h) in [(1, "aa"), (2, "bb")] {
             conn.execute(
-                &format!("INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES ({g},'{h}',100,0)"),
+                &format!(
+                    "INSERT INTO games(game_id,hash,bust_centi,is_green) VALUES ({g},'{h}',100,0)"
+                ),
                 (),
             )
             .await
@@ -1322,8 +1643,12 @@ mod tests {
         }
         let sql = "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1";
         // Same SQL, different bound game number → independent cache entries.
-        let a = cached_query_rows(&conn, sql, vec![Json::from(1)]).await.unwrap();
-        let b = cached_query_rows(&conn, sql, vec![Json::from(2)]).await.unwrap();
+        let a = cached_query_rows(&conn, sql, vec![Json::from(1)])
+            .await
+            .unwrap();
+        let b = cached_query_rows(&conn, sql, vec![Json::from(2)])
+            .await
+            .unwrap();
         assert_eq!(a[0]["c"].as_i64().unwrap(), 1);
         assert_eq!(b[0]["c"].as_i64().unwrap(), 2);
         assert_ne!(
@@ -1351,13 +1676,114 @@ mod tests {
             classic_start,
             100,
             &queries,
+            None,
             &|_, _, _| {},
         )
         .await
         .unwrap();
 
         // The precompute pass wrote the result into the cache for reuse next run.
-        assert_eq!(scalar(&conn, "SELECT COUNT(*) AS c FROM query_cache", vec![]).await, 1);
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) AS c FROM query_cache", vec![]).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_cache_reuses_exact_hash_and_graph() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+        let queries = vec![PrecomputeQuery {
+            id: "count".to_string(),
+            sql: "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1".to_string(),
+        }];
+
+        let first = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &queries,
+            None,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.results["count"][0]["c"].as_i64().unwrap(), 6);
+
+        // Remove the lower-level caches. A second call can only succeed via the
+        // graph_cache exact hit because lookup/fill/query no longer have data.
+        conn.execute("DELETE FROM query_cache", ()).await.unwrap();
+        conn.execute("DELETE FROM games", ()).await.unwrap();
+
+        let second = run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            0,
+            &queries,
+            None,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.from_game, first.from_game);
+        assert_eq!(second.results["count"][0]["c"].as_i64().unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn graph_cache_keys_on_graph_definition() {
+        let conn = mem_conn().await;
+        let inception = synthetic_inception(START, 10);
+        let classic_start = 1_000u64;
+        let offset = classic_start - 5;
+        let count = vec![PrecomputeQuery {
+            id: "count".to_string(),
+            sql: "SELECT COUNT(*) AS c FROM games WHERE game_id <= ?1".to_string(),
+        }];
+        let max = vec![PrecomputeQuery {
+            id: "max".to_string(),
+            sql: "SELECT MAX(game_id) AS c FROM games WHERE game_id <= ?1".to_string(),
+        }];
+
+        run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &count,
+            None,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+        run_history(
+            &conn,
+            START,
+            &inception,
+            offset,
+            classic_start,
+            100,
+            &max,
+            None,
+            &|_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) AS c FROM graph_cache", vec![]).await,
+            2
+        );
+        assert_ne!(graph_cache_key(&count), graph_cache_key(&max));
     }
 
     #[tokio::test]

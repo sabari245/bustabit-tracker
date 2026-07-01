@@ -62,6 +62,89 @@ export function seedLayout(): DashboardSpec {
   return ensureIds(normalizeRows(DASHBOARD));
 }
 
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function hasWidgetTitle(spec: DashboardSpec, title: string): boolean {
+  return spec.rows.some((row) =>
+    row.widgets.some((w) => "title" in w && w.title === title),
+  );
+}
+
+function findDefaultWidget(title: string): Widget | null {
+  for (const row of DASHBOARD.rows) {
+    for (const widget of row.widgets) {
+      if ("title" in widget && widget.title === title) return clone(widget);
+    }
+  }
+  return null;
+}
+
+function withoutWidgetTitle(spec: DashboardSpec, title: string): {
+  spec: DashboardSpec;
+  changed: boolean;
+} {
+  let changed = false;
+  const rows = spec.rows
+    .map((row) => {
+      const widgets = row.widgets.filter((w) => {
+        const remove = "title" in w && w.title === title;
+        if (remove) changed = true;
+        return !remove;
+      });
+      return { ...row, widgets };
+    })
+    .filter((row) => row.widgets.length > 0);
+  return { spec: changed ? { rows } : spec, changed };
+}
+
+function appendDefaultWidget(spec: DashboardSpec, title: string): {
+  spec: DashboardSpec;
+  changed: boolean;
+} {
+  if (hasWidgetTitle(spec, title)) return { spec, changed: false };
+  const widget = findDefaultWidget(title);
+  if (!widget) return { spec, changed: false };
+  return {
+    spec: {
+      rows: [
+        ...spec.rows,
+        { id: genId(), widgets: [{ ...widget, id: genId() }] },
+      ],
+    },
+    changed: true,
+  };
+}
+
+/**
+ * Add default widgets introduced after a user already had a persisted layout.
+ * This keeps existing custom layouts intact while still surfacing new built-ins.
+ */
+export function migrateLayout(spec: DashboardSpec): {
+  spec: DashboardSpec;
+  changed: boolean;
+} {
+  let next = spec;
+  let changed = false;
+
+  const removed = withoutWidgetTitle(next, "Streak lengths");
+  next = removed.spec;
+  changed = changed || removed.changed;
+
+  for (const title of [
+    "Green streaks",
+    "Alternating streaks (red start)",
+    "Alternating streaks (green start)",
+  ]) {
+    const added = appendDefaultWidget(next, title);
+    next = added.spec;
+    changed = changed || added.changed;
+  }
+
+  return { spec: next, changed };
+}
+
 /** Create a fresh widget id (for newly authored charts). */
 export const newWidgetId = genId;
 

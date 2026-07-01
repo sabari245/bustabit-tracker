@@ -23,6 +23,7 @@ import type { DashboardSpec } from "@/lib/dashboard-spec";
 import {
   extractQueries,
   loadLayout,
+  migrateLayout,
   saveLayout,
   seedLayout,
 } from "@/lib/layout";
@@ -36,9 +37,24 @@ type Prepared = {
   results: Record<string, Row[]>;
 };
 
+type HistoryState = {
+  last_hash: string;
+  last_game_id: number;
+  last_computed_at: string;
+  highest_hash: string;
+  highest_game_id: number;
+  highest_computed_at: string;
+};
+
+function formatSavedAt(value: string): string {
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? value : d.toLocaleString();
+}
+
 function App() {
   const [hash, setHash] = useState("");
   const [prepared, setPrepared] = useState<Prepared | null>(null);
+  const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [layout, setLayout] = useState<DashboardSpec | null>(null);
@@ -49,17 +65,35 @@ function App() {
   });
 
   // Load the persisted dashboard layout once; seed it from the built-in
-  // dashboard (and persist that seed) on first run.
+  // dashboard on first run, migrate older saved layouts, then restore the
+  // highest analysed hash if one was saved.
   useEffect(() => {
-    loadLayout().then((stored) => {
+    let active = true;
+    async function boot() {
+      const stored = await loadLayout();
+      let nextLayout: DashboardSpec;
       if (stored) {
-        setLayout(stored);
+        const migrated = migrateLayout(stored);
+        nextLayout = migrated.spec;
+        if (migrated.changed) saveLayout(nextLayout);
       } else {
-        const seeded = seedLayout();
-        setLayout(seeded);
-        saveLayout(seeded);
+        nextLayout = seedLayout();
+        saveLayout(nextLayout);
       }
-    });
+
+      if (!active) return;
+      setLayout(nextLayout);
+
+      const state = await invoke<HistoryState | null>("load_history_state");
+      if (!active || !state) return;
+      setHistoryState(state);
+      setHash(state.highest_hash);
+      await prepareHistory(state.highest_hash, nextLayout, null);
+    }
+    boot().catch((e) => active && setError(String(e)));
+    return () => {
+      active = false;
+    };
   }, []);
 
   function updateLayout(spec: DashboardSpec) {
@@ -67,8 +101,11 @@ function App() {
     saveLayout(spec);
   }
 
-  async function computeHistory() {
-    if (!layout) return;
+  async function prepareHistory(
+    gameHash: string,
+    spec: DashboardSpec,
+    computedAt: string | null,
+  ) {
     setError(null);
     setPrepared(null);
     setProgress({ phase: "locating", current: 0, total: 0 });
@@ -79,16 +116,42 @@ function App() {
     );
     try {
       const result = await invoke<Prepared>("compute_history", {
-        gameHash: hash,
-        queries: extractQueries(layout),
+        gameHash,
+        queries: extractQueries(spec),
+        computedAt,
       });
       setPrepared(result);
+      if (computedAt) {
+        const next: HistoryState = {
+          last_hash: gameHash,
+          last_game_id: result.from_game,
+          last_computed_at: computedAt,
+          highest_hash:
+            historyState == null || result.from_game >= historyState.highest_game_id
+              ? gameHash
+              : historyState.highest_hash,
+          highest_game_id: Math.max(
+            result.from_game,
+            historyState?.highest_game_id ?? result.from_game,
+          ),
+          highest_computed_at:
+            historyState == null || result.from_game >= historyState.highest_game_id
+              ? computedAt
+              : historyState.highest_computed_at,
+        };
+        setHistoryState(next);
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       unlisten();
       setLoading(false);
     }
+  }
+
+  async function computeHistory() {
+    if (!layout) return;
+    await prepareHistory(hash, layout, new Date().toISOString());
   }
 
   const canSubmit = hash.trim().length > 0 && layout != null;
@@ -134,6 +197,13 @@ function App() {
               </form>
               {error && (
                 <p className="mt-3 text-sm text-destructive">{error}</p>
+              )}
+              {historyState && (
+                <p className="mt-3 text-sm text-muted-foreground">
+                  Last analysed game #{historyState.last_game_id.toLocaleString()}{" "}
+                  at {formatSavedAt(historyState.last_computed_at)}. Highest saved
+                  game #{historyState.highest_game_id.toLocaleString()}.
+                </p>
               )}
             </CardContent>
           </Card>
