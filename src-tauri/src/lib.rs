@@ -145,6 +145,81 @@ struct HistoryState {
     highest_computed_at: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BacktestCacheInfo {
+    count: u64,
+    min_game_id: Option<u64>,
+    max_game_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BacktestGame {
+    game_id: u64,
+    hash: String,
+    bust: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveBacktestInput {
+    name: String,
+    script: String,
+    starting_balance: i64,
+    start_game_id: u64,
+    end_game_id: u64,
+    games: u64,
+    final_balance: i64,
+    profit: i64,
+    wagered: i64,
+    bets: u64,
+    wins: u64,
+    losses: u64,
+    max_drawdown: i64,
+    created_at: String,
+    result_json: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedBacktestSummary {
+    id: i64,
+    name: String,
+    created_at: String,
+    start_game_id: u64,
+    end_game_id: u64,
+    games: u64,
+    final_balance: i64,
+    profit: i64,
+    wagered: i64,
+    bets: u64,
+    wins: u64,
+    losses: u64,
+    max_drawdown: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedBacktestDetail {
+    id: i64,
+    name: String,
+    script: String,
+    starting_balance: i64,
+    start_game_id: u64,
+    end_game_id: u64,
+    games: u64,
+    final_balance: i64,
+    profit: i64,
+    wagered: i64,
+    bets: u64,
+    wins: u64,
+    losses: u64,
+    max_drawdown: i64,
+    created_at: String,
+    result_json: String,
+}
+
 /// Resolve (and create) the on-disk cache path: `<app data dir>/history.db`.
 fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
@@ -606,6 +681,24 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
              highest_hash        TEXT    NOT NULL,\n\
              highest_game_id     INTEGER NOT NULL,\n\
              highest_computed_at TEXT    NOT NULL\n\
+         );\n\
+         CREATE TABLE IF NOT EXISTS backtests (\n\
+             id                INTEGER PRIMARY KEY AUTOINCREMENT,\n\
+             name              TEXT    NOT NULL,\n\
+             script            TEXT    NOT NULL,\n\
+             starting_balance  INTEGER NOT NULL,\n\
+             start_game_id     INTEGER NOT NULL,\n\
+             end_game_id       INTEGER NOT NULL,\n\
+             games             INTEGER NOT NULL,\n\
+             final_balance     INTEGER NOT NULL,\n\
+             profit            INTEGER NOT NULL,\n\
+             wagered           INTEGER NOT NULL,\n\
+             bets              INTEGER NOT NULL,\n\
+             wins              INTEGER NOT NULL,\n\
+             losses            INTEGER NOT NULL,\n\
+             max_drawdown      INTEGER NOT NULL,\n\
+             created_at        TEXT    NOT NULL,\n\
+             result_json       TEXT    NOT NULL\n\
          );",
     )
     .await
@@ -1028,6 +1121,277 @@ async fn count_games(conn: &libsql::Connection) -> Result<u64, String> {
     Ok(c.max(0) as u64)
 }
 
+#[tauri::command]
+async fn load_backtest_cache_info(app: tauri::AppHandle) -> Result<BacktestCacheInfo, String> {
+    let conn = open_db_conn(&app).await?;
+    let mut rows = conn
+        .query("SELECT COUNT(*), MIN(game_id), MAX(game_id) FROM games", ())
+        .await
+        .map_err(|e| format!("cache info failed: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("cache info failed: {e}"))?
+        .ok_or_else(|| "cache info returned no rows".to_string())?;
+    let count: i64 = row.get(0).map_err(|e| format!("cache info failed: {e}"))?;
+    let min_game_id: Option<i64> = row.get(1).map_err(|e| format!("cache info failed: {e}"))?;
+    let max_game_id: Option<i64> = row.get(2).map_err(|e| format!("cache info failed: {e}"))?;
+    Ok(BacktestCacheInfo {
+        count: count.max(0) as u64,
+        min_game_id: min_game_id.map(|n| n as u64),
+        max_game_id: max_game_id.map(|n| n as u64),
+    })
+}
+
+#[tauri::command]
+async fn load_backtest_games(
+    app: tauri::AppHandle,
+    after_game_id: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Vec<BacktestGame>, String> {
+    let conn = open_db_conn(&app).await?;
+    let limit = limit.unwrap_or(50_000).clamp(1, 100_000) as i64;
+    let mut out = Vec::new();
+    let after = after_game_id.unwrap_or(0) as i64;
+
+    let mut rows = conn
+        .query(
+            "SELECT game_id, hash, bust_centi FROM games\n\
+             WHERE game_id > ?1 ORDER BY game_id LIMIT ?2",
+            libsql::params![after, limit],
+        )
+        .await
+        .map_err(|e| format!("couldn't load backtest games: {e}"))?;
+
+    while let Some(r) = rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't load backtest games: {e}"))?
+    {
+        let game_id: i64 = r
+            .get(0)
+            .map_err(|e| format!("couldn't load backtest games: {e}"))?;
+        let hash: String = r
+            .get(1)
+            .map_err(|e| format!("couldn't load backtest games: {e}"))?;
+        let bust_centi: i64 = r
+            .get(2)
+            .map_err(|e| format!("couldn't load backtest games: {e}"))?;
+        out.push(BacktestGame {
+            game_id: game_id as u64,
+            hash,
+            bust: bust_centi as f64 / 100.0,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn save_backtest(app: tauri::AppHandle, input: SaveBacktestInput) -> Result<i64, String> {
+    serde_json::from_str::<Json>(&input.result_json)
+        .map_err(|e| format!("backtest result isn't valid JSON: {e}"))?;
+    let conn = open_db_conn(&app).await?;
+    conn.execute(
+        "INSERT INTO backtests(\n\
+             name, script, starting_balance, start_game_id, end_game_id, games,\n\
+             final_balance, profit, wagered, bets, wins, losses, max_drawdown,\n\
+             created_at, result_json\n\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        libsql::params![
+            input.name,
+            input.script,
+            input.starting_balance,
+            input.start_game_id as i64,
+            input.end_game_id as i64,
+            input.games as i64,
+            input.final_balance,
+            input.profit,
+            input.wagered,
+            input.bets as i64,
+            input.wins as i64,
+            input.losses as i64,
+            input.max_drawdown,
+            input.created_at,
+            input.result_json
+        ],
+    )
+    .await
+    .map_err(|e| format!("couldn't save backtest: {e}"))?;
+
+    let mut rows = conn
+        .query("SELECT last_insert_rowid()", ())
+        .await
+        .map_err(|e| format!("couldn't read saved backtest id: {e}"))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't read saved backtest id: {e}"))?
+        .ok_or_else(|| "saved backtest id returned no rows".to_string())?;
+    row.get(0)
+        .map_err(|e| format!("couldn't read saved backtest id: {e}"))
+}
+
+#[tauri::command]
+async fn list_backtests(app: tauri::AppHandle) -> Result<Vec<SavedBacktestSummary>, String> {
+    let conn = open_db_conn(&app).await?;
+    let mut rows = conn
+        .query(
+            "SELECT id, name, created_at, start_game_id, end_game_id, games,\n\
+                    final_balance, profit, wagered, bets, wins, losses, max_drawdown\n\
+             FROM backtests ORDER BY id DESC LIMIT 100",
+            (),
+        )
+        .await
+        .map_err(|e| format!("couldn't list backtests: {e}"))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't list backtests: {e}"))?
+    {
+        let start_game_id: i64 = r
+            .get(3)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        let end_game_id: i64 = r
+            .get(4)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        let games: i64 = r
+            .get(5)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        let bets: i64 = r
+            .get(9)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        let wins: i64 = r
+            .get(10)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        let losses: i64 = r
+            .get(11)
+            .map_err(|e| format!("couldn't list backtests: {e}"))?;
+        out.push(SavedBacktestSummary {
+            id: r
+                .get(0)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            name: r
+                .get(1)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            created_at: r
+                .get(2)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            start_game_id: start_game_id as u64,
+            end_game_id: end_game_id as u64,
+            games: games as u64,
+            final_balance: r
+                .get(6)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            profit: r
+                .get(7)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            wagered: r
+                .get(8)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+            bets: bets as u64,
+            wins: wins as u64,
+            losses: losses as u64,
+            max_drawdown: r
+                .get(12)
+                .map_err(|e| format!("couldn't list backtests: {e}"))?,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+async fn delete_backtest(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let conn = open_db_conn(&app).await?;
+    conn.execute("DELETE FROM backtests WHERE id = ?1", libsql::params![id])
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("couldn't delete backtest: {e}"))
+}
+
+#[tauri::command]
+async fn get_backtest(
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<Option<SavedBacktestDetail>, String> {
+    let conn = open_db_conn(&app).await?;
+    let mut rows = conn
+        .query(
+            "SELECT id, name, script, starting_balance, start_game_id, end_game_id,\n\
+                    games, final_balance, profit, wagered, bets, wins, losses,\n\
+                    max_drawdown, created_at, result_json\n\
+             FROM backtests WHERE id = ?1",
+            libsql::params![id],
+        )
+        .await
+        .map_err(|e| format!("couldn't load backtest: {e}"))?;
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't load backtest: {e}"))?
+    {
+        Some(r) => {
+            let start_game_id: i64 = r
+                .get(4)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            let end_game_id: i64 = r
+                .get(5)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            let games: i64 = r
+                .get(6)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            let bets: i64 = r
+                .get(10)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            let wins: i64 = r
+                .get(11)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            let losses: i64 = r
+                .get(12)
+                .map_err(|e| format!("couldn't load backtest: {e}"))?;
+            Ok(Some(SavedBacktestDetail {
+                id: r
+                    .get(0)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                name: r
+                    .get(1)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                script: r
+                    .get(2)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                starting_balance: r
+                    .get(3)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                start_game_id: start_game_id as u64,
+                end_game_id: end_game_id as u64,
+                games: games as u64,
+                final_balance: r
+                    .get(7)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                profit: r
+                    .get(8)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                wagered: r
+                    .get(9)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                bets: bets as u64,
+                wins: wins as u64,
+                losses: losses as u64,
+                max_drawdown: r
+                    .get(13)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                created_at: r
+                    .get(14)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+                result_json: r
+                    .get(15)
+                    .map_err(|e| format!("couldn't load backtest: {e}"))?,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Export the entire cached game history to an `.xlsx` file at `path`. The whole
 /// `games` table is written — game number, provably-fair hash, the bust multiplier
 /// (centi → real ×), and the 2× green/red result — under a titled, frozen header.
@@ -1199,6 +1563,12 @@ pub fn run() {
             load_history_state,
             load_layout,
             save_layout,
+            load_backtest_cache_info,
+            load_backtest_games,
+            save_backtest,
+            list_backtests,
+            get_backtest,
+            delete_backtest,
             export_history
         ])
         .run(tauri::generate_context!())
