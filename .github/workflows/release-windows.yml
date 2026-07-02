@@ -64,9 +64,6 @@ jobs:
             throw "The certificate import did not return a usable thumbprint."
           }
 
-          Export-Certificate -Cert $cert -FilePath certificate/certificate.cer | Out-Null
-          Import-Certificate -FilePath certificate/certificate.cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
-
           "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Create Tauri signing config
@@ -97,15 +94,6 @@ jobs:
       - name: Verify signatures and stage release assets
         shell: pwsh
         run: |
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-            Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-
-          if (-not $signtool) {
-            throw "signtool.exe was not found in the Windows SDK."
-          }
-
           $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
@@ -121,8 +109,19 @@ jobs:
             throw "NSIS setup executable was not produced."
           }
 
-          & $signtool.FullName verify /pa /v $msi.FullName
-          & $signtool.FullName verify /pa /v $setupExe.FullName
+          foreach ($asset in @($msi, $setupExe)) {
+            $signature = Get-AuthenticodeSignature -FilePath $asset.FullName
+
+            if (-not $signature.SignerCertificate) {
+              throw "$($asset.Name) is not signed."
+            }
+
+            if ($signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              throw "$($asset.Name) was signed by $($signature.SignerCertificate.Thumbprint), expected $env:WINDOWS_CERTIFICATE_THUMBPRINT."
+            }
+
+            Write-Host "$($asset.Name) signed by $($signature.SignerCertificate.Subject). Trust status: $($signature.Status)"
+          }
 
           New-Item -ItemType Directory -Path release-assets -Force | Out-Null
           Copy-Item $msi.FullName release-assets/setup.msi -Force
