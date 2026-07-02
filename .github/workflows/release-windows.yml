@@ -1,0 +1,149 @@
+name: Release Windows installers
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    name: Build, sign, and publish Windows installers
+    runs-on: windows-latest
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Import Windows code-signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE)) {
+            throw "Missing GitHub secret WINDOWS_CERTIFICATE. Store the base64-encoded .pfx there."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "Missing GitHub secret WINDOWS_CERTIFICATE_PASSWORD. Store the .pfx export password there."
+          }
+
+          New-Item -ItemType Directory -Path certificate -Force | Out-Null
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Remove-Item certificate/tempCert.txt -Force
+
+          $securePassword = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $imported = Import-PfxCertificate -FilePath certificate/certificate.pfx -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword
+          $cert = @($imported)[0]
+
+          if (-not $cert -or [string]::IsNullOrWhiteSpace($cert.Thumbprint)) {
+            throw "The certificate import did not return a usable thumbprint."
+          }
+
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create Tauri signing config
+        shell: pwsh
+        env:
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+            $timestampUrl = "http://timestamp.digicert.com"
+          }
+
+          $config = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $env:WINDOWS_CERTIFICATE_THUMBPRINT
+                digestAlgorithm = "sha256"
+                timestampUrl = $timestampUrl
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+
+          Set-Content -Path src-tauri/tauri.windows-signing.conf.json -Value $config
+
+      - name: Build signed Windows installers
+        run: bun run tauri build --config src-tauri/tauri.windows-signing.conf.json --bundles msi nsis --ci
+
+      - name: Verify signatures and stage release assets
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -like "*\x64\signtool.exe" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            throw "signtool.exe was not found in the Windows SDK."
+          }
+
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          $setupExe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $msi) {
+            throw "MSI bundle was not produced."
+          }
+
+          if (-not $setupExe) {
+            throw "NSIS setup executable was not produced."
+          }
+
+          & $signtool.FullName verify /pa /v $msi.FullName
+          & $signtool.FullName verify /pa /v $setupExe.FullName
+
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Copy-Item $msi.FullName release-assets/setup.msi -Force
+          Copy-Item $setupExe.FullName release-assets/setup.exe -Force
+          Get-FileHash release-assets/setup.msi -Algorithm SHA256
+          Get-FileHash release-assets/setup.exe -Algorithm SHA256
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $title = "bustabit-tracker $tag"
+          $notes = @"
+          Signed Windows installers for $tag.
+
+          - setup.msi: MSI installer
+          - setup.exe: NSIS setup installer
+          "@
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag release-assets/setup.msi release-assets/setup.exe --clobber
+          } else {
+            gh release create $tag release-assets/setup.msi release-assets/setup.exe --title $title --notes $notes --verify-tag
+          }
