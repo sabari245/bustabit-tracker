@@ -64,6 +64,9 @@ jobs:
             throw "The certificate import did not return a usable thumbprint."
           }
 
+          Export-Certificate -Cert $cert -FilePath certificate/certificate.cer | Out-Null
+          Import-Certificate -FilePath certificate/certificate.cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+
           "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Create Tauri signing config
