@@ -17,6 +17,11 @@ const PROGRESS_MASK: u64 = 0x3FFFF;
 /// Roughly every 16k rows gives visible feedback without spamming the webview.
 const EXPORT_PROGRESS_MASK: u64 = 0x3FFF;
 
+/// How long SQLite should wait for another writer before returning
+/// `database is locked`. Startup and UI commands can overlap briefly, and
+/// history computation writes in batches, so a short timeout is too brittle.
+const DB_BUSY_TIMEOUT_MS: u64 = 30_000;
+
 /// Rows per batched INSERT when filling the cache. Big enough that the per-
 /// statement overhead is negligible, small enough to keep the SQL string and
 /// the SQLite parser comfortable.
@@ -267,14 +272,7 @@ async fn compute_history(
                     },
                 );
             };
-            let db = libsql::Builder::new_local(db_path)
-                .build()
-                .await
-                .map_err(|e| format!("couldn't open cache db: {e}"))?;
-            let conn = db
-                .connect()
-                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
-            ensure_schema(&conn).await?;
+            let conn = open_db_conn_at_path(db_path).await?;
             run_history(
                 &conn,
                 &game_hash,
@@ -316,32 +314,14 @@ async fn run_query(
             .build()
             .map_err(|e| format!("runtime init failed: {e}"))?;
         rt.block_on(async move {
-            let db = libsql::Builder::new_local(db_path)
-                .build()
-                .await
-                .map_err(|e| format!("couldn't open cache db: {e}"))?;
-            let conn = db
-                .connect()
-                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
-            // Wait (up to 5s) for a competing writer's lock to clear instead of
-            // failing instantly with "database is locked" when adding a chart races
-            // a layout save or a sibling widget's cache write.
-            // `PRAGMA busy_timeout = N` reports back the new value as a result row,
-            // so it must go through `query` — `execute` rejects row-returning
-            // statements with "Execute returned rows".
-            conn.query("PRAGMA busy_timeout = 5000", ())
-                .await
-                .map_err(|e| format!("couldn't set busy timeout: {e}"))?;
+            let conn = open_db_conn_at_path(db_path).await?;
 
             // The result cache is a pure optimization: if any cache step can't run
-            // (table init, lookup, or write), fall back to just computing the query
-            // so a freshly added chart still renders rather than erroring out.
+            // (lookup or write), fall back to just computing the query so a freshly
+            // added chart still renders rather than erroring out.
             let key = query_cache_key(&sql, &params);
-            let cacheable = ensure_cache_table(&conn).await.is_ok();
-            if cacheable {
-                if let Ok(Some(hit)) = cache_get(&conn, &key).await {
-                    return Ok(hit);
-                }
+            if let Ok(Some(hit)) = cache_get(&conn, &key).await {
+                return Ok(hit);
             }
 
             // Run the untrusted user SQL sandboxed (read-only), then drop the guard
@@ -354,9 +334,7 @@ async fn run_query(
                 .await
                 .map_err(|e| format!("couldn't clear read-only mode: {e}"))?;
             let rows = computed?;
-            if cacheable {
-                let _ = cache_put(&conn, &key, &rows).await;
-            }
+            let _ = cache_put(&conn, &key, &rows).await;
             Ok(rows)
         })
     })
@@ -373,10 +351,7 @@ async fn load_history_state(app: tauri::AppHandle) -> Result<Option<HistoryState
     read_history_state(&conn).await
 }
 
-/// Open the cache db and ensure the schema exists. Used by the lightweight
-/// layout commands (no heavy CPU, so they run directly on the async runtime).
-async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, String> {
-    let path = db_path(app)?;
+async fn open_db_conn_at_path(path: PathBuf) -> Result<libsql::Connection, String> {
     let db = libsql::Builder::new_local(path)
         .build()
         .await
@@ -384,8 +359,38 @@ async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, Stri
     let conn = db
         .connect()
         .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
-    ensure_schema(&conn).await?;
+    configure_db_conn(&conn).await?;
     Ok(conn)
+}
+
+async fn configure_db_conn(conn: &libsql::Connection) -> Result<(), String> {
+    // `PRAGMA busy_timeout = N` returns a row, so it must go through `query`.
+    // Set it immediately after connect, before any statement that could hit a
+    // write lock.
+    let mut rows = conn
+        .query(&format!("PRAGMA busy_timeout = {DB_BUSY_TIMEOUT_MS}"), ())
+        .await
+        .map_err(|e| format!("couldn't set busy timeout: {e}"))?;
+    while rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't set busy timeout: {e}"))?
+        .is_some()
+    {}
+    Ok(())
+}
+
+/// Open the cache DB for ordinary app commands. Schema creation/migration is
+/// handled once during Tauri startup by `init_database`, avoiding concurrent
+/// `CREATE TABLE`/`CREATE INDEX` attempts from unrelated commands.
+async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, String> {
+    open_db_conn_at_path(db_path(app)?).await
+}
+
+async fn init_database(app: &tauri::AppHandle) -> Result<(), String> {
+    let conn = open_db_conn(app).await?;
+    ensure_schema(&conn).await?;
+    Ok(())
 }
 
 /// Load the single persisted dashboard layout (a JSON spec), or `None` on first
@@ -662,7 +667,6 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\n\
          PRAGMA synchronous=NORMAL;\n\
-         PRAGMA busy_timeout=5000;\n\
          CREATE TABLE IF NOT EXISTS games (\n\
              game_id    INTEGER PRIMARY KEY,\n\
              hash       TEXT    NOT NULL UNIQUE,\n\
@@ -1424,13 +1428,7 @@ async fn export_history(
             };
 
             report("loading", 0, 0);
-            let db = libsql::Builder::new_local(db_path)
-                .build()
-                .await
-                .map_err(|e| format!("couldn't open cache db: {e}"))?;
-            let conn = db
-                .connect()
-                .map_err(|e| format!("couldn't connect to cache db: {e}"))?;
+            let conn = open_db_conn_at_path(db_path).await?;
 
             let total = count_games(&conn).await?;
             report("loading", 0, total);
@@ -1555,6 +1553,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::block_on(init_database(&handle))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e).into())
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             bust_from_hash,

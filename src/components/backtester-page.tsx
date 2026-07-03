@@ -8,6 +8,7 @@ import {
   bitsToSats,
   formatBits,
   parseBacktestDetail,
+  type BacktestPoint,
   type BacktestGame,
 } from "@/lib/backtester";
 import type { ChartWidgetSpec } from "@/lib/dashboard-spec";
@@ -120,17 +121,33 @@ function Metric({ label, value }: { label: string; value: string }) {
 
 function EquityChart({ result }: { result: BacktestDetail }) {
   const detail = useMemo(() => parseBacktestDetail(result.resultJson), [result.resultJson]);
-  const rows: Row[] = detail.balanceSeries.map((p) => ({
-    game: p.gameId,
+  const initialGameId = result.startGameId > 0 ? result.startGameId - 1 : result.startGameId;
+  const initialPoint: BacktestPoint = {
+    gameId: initialGameId,
+    balance: result.startingBalance,
+    profit: 0,
+  };
+  const points =
+    detail.balanceSeries[0]?.balance === result.startingBalance &&
+    detail.balanceSeries[0]?.gameId <= result.startGameId
+      ? detail.balanceSeries
+      : [initialPoint, ...detail.balanceSeries];
+  // Display the game's position within the run (1, 2, 3, …) rather than the raw
+  // gameId. Based on the gameId offset so spacing stays correct even after the
+  // balance series is compacted; the pre-run initial point maps to 0.
+  const rows: Row[] = points.map((p) => ({
+    game: p.gameId - result.startGameId + 1,
     balance: p.balance / 100,
   }));
   const balanceSeries = EQUITY_CHART.series ?? [];
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-2 text-sm text-muted-foreground">
-        <span className="h-0.5 w-6 rounded-full bg-chart-2" />
-        <span>Balance</span>
+      <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+        <span className="flex items-center gap-2">
+          <span className="h-0.5 w-6 rounded-full bg-chart-2" />
+          <span>Balance</span>
+        </span>
       </div>
       <UplotChart
         widget={EQUITY_CHART}
@@ -138,6 +155,7 @@ function EquityChart({ result }: { result: BacktestDetail }) {
         x="game"
         series={balanceSeries}
         numericX
+        interactive
       />
       <div className="grid gap-3 sm:grid-cols-3">
         <Metric
@@ -199,7 +217,8 @@ export function BacktesterPage() {
 
   useEffect(() => {
     async function boot() {
-      await Promise.all([refreshCacheInfo(), refreshBacktests()]);
+      await refreshCacheInfo();
+      await refreshBacktests();
     }
     boot().catch((e) => setError(String(e)));
   }, []);
@@ -219,7 +238,6 @@ export function BacktesterPage() {
         name.trim() || "Backtest",
         script,
         bitsToSats(Number(startingBits) || 0),
-        info.count,
       );
       setProgress({ current: 0, total: info.count });
 
@@ -235,7 +253,6 @@ export function BacktesterPage() {
         loaded += batch.length;
         afterGameId = batch[batch.length - 1].gameId;
         setProgress({ current: Math.min(loaded, info.count), total: info.count });
-        if (runner.isStopped()) break;
         await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       }
 

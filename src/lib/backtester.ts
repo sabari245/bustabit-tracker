@@ -41,6 +41,8 @@ type HistoryGame = BacktestGame & {
 
 type Listener = (...args: unknown[]) => void;
 
+const MAX_BALANCE_SERIES_POINTS = 2400;
+
 class Emitter {
   private listeners = new Map<string, Listener[]>();
 
@@ -118,11 +120,7 @@ export const DEFAULT_BACKTEST_SCRIPT = `var config = {
 };
 
 engine.on('GAME_STARTING', function () {
-  if (userInfo.balance < config.baseBet.value) {
-    stop('Insufficient balance');
-    return;
-  }
-
+  // Balance is allowed to go negative — the backtest runs the full history.
   engine.bet(config.baseBet.value, config.payout.value);
 });
 
@@ -188,17 +186,15 @@ export class AutobetBacktestRunner {
   private maxDrawdown = 0;
   private cashOuts: Array<{ uname: string; wager: number; cashedAt: number }> = [];
   private gameState: "GAME_STARTING" | "GAME_STARTED" | "GAME_ENDED" = "GAME_STARTED";
-  private readonly sampleEvery: number;
+  private balanceSampleEvery = 1;
   private readonly createdAt = new Date().toISOString();
 
   constructor(
     private readonly name: string,
     private readonly script: string,
     private readonly startingBalance: number,
-    totalGames: number,
   ) {
     this.balance = Math.max(0, Math.floor(startingBalance));
-    this.sampleEvery = Math.max(1, Math.ceil(totalGames / 2400));
     this.peak = point(0, this.balance, this.startingBalance);
     this.trough = this.peak;
     this.maxDrawdownAt = this.peak;
@@ -248,12 +244,8 @@ export class AutobetBacktestRunner {
           throw new Error("engine.bet payout must be greater than 1.");
         }
         if (this.queuedBet) throw new Error("A bet is already queued for the next game.");
-        if (cleanWager > this.balance) {
-          if (this.logs.length < 500) {
-            this.logs.push(`bet rejected: insufficient balance to bet ${cleanWager / 100} bits`);
-          }
-          return false;
-        }
+        // Balance is allowed to go negative — the backtest models a hypothetical
+        // where every bet is always placed and the run covers the full history.
         this.balance -= cleanWager;
         this.wagered += cleanWager;
         this.queuedBet = { wager: cleanWager, payout: cleanPayout };
@@ -287,10 +279,11 @@ export class AutobetBacktestRunner {
       if (this.notifications.length < 100) this.notifications.push(String(message));
       log("notify:", message);
     };
+    // The backtest always runs the entire cached history. stop() is kept so
+    // existing scripts don't error, but it no longer halts the run — it just
+    // notes the reason in the log.
     const stop = (reason?: unknown) => {
-      this.stopped = true;
-      this.stopReason = reason == null ? "Script stopped." : String(reason);
-      log("stop:", this.stopReason);
+      log("stop (ignored, running full history):", reason == null ? "Script stopped." : String(reason));
     };
 
     const fn = new Function(
@@ -315,7 +308,6 @@ ${script}
 
   process(games: BacktestGame[]) {
     for (const game of games) {
-      if (this.stopped) break;
       this.processGame(game);
     }
   }
@@ -328,7 +320,7 @@ ${script}
     if (this.games === 0) throw new Error("No cached games are available to backtest.");
     const last = this.balanceSeries[this.balanceSeries.length - 1];
     if (!last || last.gameId !== this.endGameId) {
-      this.balanceSeries.push(point(this.endGameId, this.balance, this.startingBalance));
+      this.recordBalancePoint(point(this.endGameId, this.balance, this.startingBalance), true);
     }
     const detail: BacktestDetailJson = {
       logs: this.logs,
@@ -360,7 +352,15 @@ ${script}
   }
 
   private processGame(game: BacktestGame) {
-    if (this.games === 0) this.startGameId = game.gameId;
+    if (this.games === 0) {
+      this.startGameId = game.gameId;
+      const initialGameId = game.gameId > 0 ? game.gameId - 1 : game.gameId;
+      const initialPoint = point(initialGameId, this.balance, this.startingBalance);
+      this.peak = initialPoint;
+      this.trough = initialPoint;
+      this.maxDrawdownAt = initialPoint;
+      this.recordBalancePoint(initialPoint, true);
+    }
     this.endGameId = game.gameId;
     this.games += 1;
 
@@ -368,7 +368,6 @@ ${script}
     this.cashOuts = [];
     this.gameState = "GAME_STARTING";
     this.engineEvents.emit("GAME_STARTING");
-    if (this.stopped) return;
 
     this.currentBet = this.queuedBet as Bet | null;
     this.queuedBet = null;
@@ -407,12 +406,39 @@ ${script}
       this.maxDrawdown = drawdown;
       this.maxDrawdownAt = p;
     }
-    if (this.games === 1 || this.games % this.sampleEvery === 0) {
-      this.balanceSeries.push(p);
-    }
+    this.recordBalancePoint(p);
 
     this.gameState = "GAME_ENDED";
     this.engineEvents.emit("GAME_ENDED");
     this.currentBet = null;
+  }
+
+  private recordBalancePoint(p: BacktestPoint, force = false) {
+    const last = this.balanceSeries[this.balanceSeries.length - 1];
+    if (last?.gameId === p.gameId) {
+      this.balanceSeries[this.balanceSeries.length - 1] = p;
+      return;
+    }
+
+    const gameOffset = Math.max(0, this.games - 1);
+    if (force || gameOffset % this.balanceSampleEvery === 0) {
+      this.balanceSeries.push(p);
+      this.compactBalanceSeries();
+    }
+  }
+
+  private compactBalanceSeries() {
+    while (this.balanceSeries.length > MAX_BALANCE_SERIES_POINTS) {
+      this.balanceSampleEvery *= 2;
+      const first = this.balanceSeries[0];
+      const last = this.balanceSeries[this.balanceSeries.length - 1];
+      this.balanceSeries = this.balanceSeries.filter(
+        (p) =>
+          p === first ||
+          p === last ||
+          (p.gameId >= this.startGameId &&
+            (p.gameId - this.startGameId) % this.balanceSampleEvery === 0),
+      );
+    }
   }
 }

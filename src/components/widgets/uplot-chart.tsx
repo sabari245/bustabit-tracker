@@ -1,11 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
+import { RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { chartNumber, type Row } from "@/lib/query";
 import type { ChartWidgetSpec, Series } from "@/lib/dashboard-spec";
 
 const FONT = "11px 'Inter Variable', sans-serif";
+
+export type ChartMarker = {
+  x: number;
+  label: string;
+  color?: string;
+};
 
 /** Resolve a colour that may be a `var(--x)` reference, against `el`'s computed style. */
 function resolveColor(el: Element, color: string): string {
@@ -23,7 +37,11 @@ function withAlpha(color: string, a: number): string {
  * series (the series name only when there's more than one), with no x-axis label
  * heading. Lives entirely in the DOM/canvas layer — no React re-render on hover.
  */
-function tooltipPlugin(series: Series[], colors: string[]): uPlot.Plugin {
+function tooltipPlugin(
+  series: Series[],
+  colors: string[],
+  formatX?: (idx: number) => string,
+): uPlot.Plugin {
   let tip: HTMLDivElement;
   const named = series.length > 1;
   return {
@@ -40,7 +58,13 @@ function tooltipPlugin(series: Series[], colors: string[]): uPlot.Plugin {
           tip.style.display = "none";
           return;
         }
-        tip.innerHTML = series
+        const heading = formatX?.(idx);
+        const headingHtml = heading
+          ? `<div class="mb-1 font-medium text-muted-foreground">${heading}</div>`
+          : "";
+        tip.innerHTML =
+          headingHtml +
+          series
           .map((s, i) => {
             const v = u.data[i + 1][idx];
             if (v == null) return "";
@@ -83,6 +107,152 @@ function refLineHook(yVal: number, color: string) {
   };
 }
 
+function clampRange(
+  min: number,
+  max: number,
+  fullMin: number,
+  fullMax: number,
+): [number, number] {
+  const width = max - min;
+  const fullWidth = fullMax - fullMin;
+  if (width >= fullWidth) return [fullMin, fullMax];
+  if (min < fullMin) return [fullMin, fullMin + width];
+  if (max > fullMax) return [fullMax - width, fullMax];
+  return [min, max];
+}
+
+function zoomX(u: uPlot, factor: number, anchor: number | null, full: [number, number]) {
+  const scale = u.scales.x;
+  const min = Number(scale.min ?? full[0]);
+  const max = Number(scale.max ?? full[1]);
+  const width = max - min;
+  if (width <= 0) return;
+  const nextWidth = Math.min(
+    full[1] - full[0],
+    Math.max(1, width * factor),
+  );
+  const pivot = anchor == null ? min + width / 2 : anchor;
+  const leftRatio = (pivot - min) / width;
+  const nextMin = pivot - nextWidth * leftRatio;
+  const nextMax = nextMin + nextWidth;
+  const [clampedMin, clampedMax] = clampRange(nextMin, nextMax, full[0], full[1]);
+  u.setScale("x", { min: clampedMin, max: clampedMax });
+}
+
+function resetZoom(u: uPlot, full: [number, number]) {
+  u.setScale("x", { min: full[0], max: full[1] });
+}
+
+function interactionPlugin(full: [number, number]): uPlot.Plugin {
+  let move: ((e: MouseEvent) => void) | null = null;
+  let up: (() => void) | null = null;
+
+  return {
+    hooks: {
+      ready: (u) => {
+        const wheel = (e: WheelEvent) => {
+          e.preventDefault();
+          const rect = u.over.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const anchor = u.posToVal(x, "x");
+          zoomX(u, e.deltaY < 0 ? 0.78 : 1.28, anchor, full);
+        };
+        const down = (e: MouseEvent) => {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          const startX = e.clientX;
+          const startMin = Number(u.scales.x.min ?? full[0]);
+          const startMax = Number(u.scales.x.max ?? full[1]);
+          const width = startMax - startMin;
+          move = (next) => {
+            const dx = next.clientX - startX;
+            const delta = (dx / Math.max(1, u.bbox.width)) * width;
+            const [min, max] = clampRange(
+              startMin - delta,
+              startMax - delta,
+              full[0],
+              full[1],
+            );
+            u.setScale("x", { min, max });
+          };
+          up = () => {
+            if (move) window.removeEventListener("mousemove", move);
+            if (up) window.removeEventListener("mouseup", up);
+            move = null;
+            up = null;
+          };
+          window.addEventListener("mousemove", move);
+          window.addEventListener("mouseup", up, { once: true });
+        };
+        const dblClick = () => resetZoom(u, full);
+        u.over.addEventListener("wheel", wheel, { passive: false });
+        u.over.addEventListener("mousedown", down);
+        u.over.addEventListener("dblclick", dblClick);
+        (u as uPlot & { _interactiveCleanup?: () => void })._interactiveCleanup = () => {
+          u.over.removeEventListener("wheel", wheel);
+          u.over.removeEventListener("mousedown", down);
+          u.over.removeEventListener("dblclick", dblClick);
+          if (move) window.removeEventListener("mousemove", move);
+          if (up) window.removeEventListener("mouseup", up);
+        };
+      },
+      destroy: (u) => {
+        (u as uPlot & { _interactiveCleanup?: () => void })._interactiveCleanup?.();
+      },
+    },
+  };
+}
+
+function markersPlugin(markers: ChartMarker[], color: string): uPlot.Plugin {
+  return {
+    hooks: {
+      draw: (u) => {
+        const { ctx } = u;
+        for (const marker of markers) {
+          const x = Math.round(u.valToPos(marker.x, "x", true));
+          if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
+
+          const stroke = marker.color ?? color;
+          ctx.save();
+          ctx.strokeStyle = stroke;
+          ctx.fillStyle = stroke;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x, u.bbox.top);
+          ctx.lineTo(x, u.bbox.top + u.bbox.height);
+          ctx.stroke();
+
+          ctx.setLineDash([]);
+          const label = marker.label;
+          if (!label) {
+            ctx.restore();
+            continue;
+          }
+          ctx.font = FONT;
+          const padX = 7;
+          const w = ctx.measureText(label).width + padX * 2;
+          const h = 18;
+          const boxX = Math.min(
+            Math.max(u.bbox.left + 4, x + 8),
+            u.bbox.left + u.bbox.width - w - 4,
+          );
+          const boxY = u.bbox.top + 8;
+          ctx.globalAlpha = 0.9;
+          ctx.beginPath();
+          ctx.roundRect(boxX, boxY, w, h, 5);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = "white";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, boxX + padX, boxY + h / 2 + 0.5);
+          ctx.restore();
+        }
+      },
+    },
+  };
+}
+
 /**
  * uPlot-backed chart. All layout/rendering runs on canvas outside React — the
  * component only mounts the instance and rebuilds it when its inputs (or the
@@ -94,14 +264,20 @@ export function UplotChart({
   x,
   series,
   numericX = false,
+  interactive = false,
+  markers = [],
 }: {
   widget: ChartWidgetSpec;
   data: Row[];
   x: string;
   series: Series[];
   numericX?: boolean;
+  interactive?: boolean;
+  markers?: ChartMarker[];
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const plotRef = useRef<uPlot | null>(null);
+  const fullXRef = useRef<[number, number] | null>(null);
   const [themeTick, setThemeTick] = useState(0);
 
   // Rebuild when the html `class` (light/dark) flips so canvas colours track it.
@@ -129,10 +305,17 @@ export function UplotChart({
       xs,
       ...series.map((s) => data.map((r) => chartNumber(r[s.key]))),
     ];
-
     const isBar = widget.type === "bar";
     const isArea = widget.type === "area";
+    const fullX: [number, number] = isBar
+      ? [-0.5, Math.max(0, n - 0.5)]
+      : numericX
+        ? [xs[0] ?? 0, xs[xs.length - 1] ?? 0]
+        : [0, Math.max(0, n - 1)];
+    fullXRef.current = fullX;
+
     const muted = css("var(--muted-foreground)");
+    const markerColor = css("var(--destructive)");
     const slot = 0.9 / series.length;
 
     // Grouped bars (general for any series count): split each unit-wide category
@@ -152,17 +335,24 @@ export function UplotChart({
     const opts: uPlot.Options = {
       width: el.clientWidth || 300,
       height: 300,
-      cursor: { x: true, y: false, points: { show: false } },
+      cursor: {
+        x: true,
+        y: false,
+        points: { show: false },
+        // We drive pan/zoom ourselves in interactionPlugin; disable uPlot's
+        // built-in drag box-zoom so it doesn't fight our mouse handlers.
+        drag: { x: false, y: false },
+      },
       legend: { show: false },
       scales: {
         x: {
           time: false,
-          range:
-            isBar
-              ? [-0.5, Math.max(0, n - 0.5)]
-              : numericX
-                ? [xs[0] ?? 0, xs[xs.length - 1] ?? 0]
-                : [0, Math.max(0, n - 1)],
+          // A static `range` tuple PINS the scale — uPlot then ignores
+          // `setScale`, so wheel/button zoom silently no-ops. For interactive
+          // charts use an identity range instead: it fits the data extent
+          // (== fullX) on init and passes our zoomed min/max straight through
+          // (no padding), so setScale drives zoom cleanly.
+          range: interactive ? (_u, min, max) => [min, max] : fullX,
         },
         y: {
           range: widget.yDomain
@@ -211,7 +401,15 @@ export function UplotChart({
               : { width: 2, paths: uPlot.paths.spline!() }),
         })),
       ],
-      plugins: [tooltipPlugin(series, colors)],
+      plugins: [
+        tooltipPlugin(series, colors, (idx) =>
+          numericX
+            ? `${widget.xTitle ? `${widget.xTitle} ` : ""}${Number(xs[idx]).toLocaleString()}`
+            : (labels[idx] ?? ""),
+        ),
+        ...(markers.length > 0 ? [markersPlugin(markers, markerColor)] : []),
+        ...(interactive ? [interactionPlugin(fullX)] : []),
+      ],
       hooks:
         widget.refLine != null
           ? { draw: [refLineHook(widget.refLine, muted)] }
@@ -219,6 +417,7 @@ export function UplotChart({
     };
 
     const u = new uPlot(opts, aligned, el);
+    plotRef.current = u;
     const ro = new ResizeObserver(() =>
       u.setSize({ width: el.clientWidth, height: 300 }),
     );
@@ -226,8 +425,74 @@ export function UplotChart({
     return () => {
       ro.disconnect();
       u.destroy();
+      plotRef.current = null;
     };
-  }, [widget, data, x, series, numericX, themeTick]);
+  }, [widget, data, x, series, numericX, interactive, markers, themeTick]);
 
-  return <div ref={ref} className="h-[300px] w-full" />;
+  function control(action: "zoom-in" | "zoom-out" | "reset") {
+    const plot = plotRef.current;
+    const full = fullXRef.current;
+    if (!plot || !full) return;
+    if (action === "zoom-in") zoomX(plot, 0.72, null, full);
+    else if (action === "zoom-out") zoomX(plot, 1.38, null, full);
+    else resetZoom(plot, full);
+  }
+
+  return (
+    <div className="group relative">
+      {interactive && (
+        <div className="absolute right-2 top-2 z-10 flex gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="secondary"
+                aria-label="Zoom in"
+                onClick={() => control("zoom-in")}
+              >
+                <ZoomIn />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Zoom in</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="secondary"
+                aria-label="Zoom out"
+                onClick={() => control("zoom-out")}
+              >
+                <ZoomOut />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Zoom out</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="secondary"
+                aria-label="Reset zoom"
+                onClick={() => control("reset")}
+              >
+                <RotateCcw />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Reset zoom</TooltipContent>
+          </Tooltip>
+        </div>
+      )}
+      <div
+        ref={ref}
+        className={cn(
+          "h-[300px] w-full",
+          interactive && "cursor-grab active:cursor-grabbing",
+        )}
+      />
+    </div>
+  );
 }

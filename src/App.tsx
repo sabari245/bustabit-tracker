@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Navbar, type AppPage } from "@/components/navbar";
 import { ThemeProvider } from "@/components/theme-provider";
 import { DashboardSection } from "@/components/dashboard-section";
@@ -77,10 +78,10 @@ function App() {
       if (stored) {
         const migrated = migrateLayout(stored);
         nextLayout = migrated.spec;
-        if (migrated.changed) saveLayout(nextLayout);
+        if (migrated.changed) await saveLayout(nextLayout);
       } else {
         nextLayout = seedLayout();
-        saveLayout(nextLayout);
+        await saveLayout(nextLayout);
       }
 
       if (!active) return;
@@ -100,7 +101,7 @@ function App() {
 
   function updateLayout(spec: DashboardSpec) {
     setLayout(spec);
-    saveLayout(spec);
+    saveLayout(spec).catch((e) => setError(String(e)));
   }
 
   async function prepareHistory(
@@ -160,70 +161,72 @@ function App() {
 
   return (
     <ThemeProvider defaultTheme="system" storageKey="vite-ui-theme">
-      <ProgressDialog open={loading} progress={progress} />
-      <div className="flex min-h-screen flex-col">
-        <Navbar page={page} onPageChange={setPage} />
-        {page === "tracker" ? (
-          <main className="flex flex-1 flex-col gap-4 p-4">
-            <Card className="w-full">
-              <CardHeader>
-                <CardTitle>Bust Calculator</CardTitle>
-                <CardDescription>
-                  Enter a classic-era game hash. Its game number is detected
-                  automatically and the full history is computed back to the start
-                  of the classic era.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <form
-                  className="flex flex-col gap-4 sm:flex-row sm:items-end"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    computeHistory();
-                  }}
-                >
-                  <div className="flex flex-1 flex-col gap-2">
-                    <Label htmlFor="hash">Game hash</Label>
-                    <Input
-                      id="hash"
-                      placeholder="64-character hex hash"
-                      value={hash}
-                      onChange={(e) => setHash(e.target.value)}
-                    />
-                  </div>
-                  <Button type="submit" disabled={!canSubmit || loading}>
-                    {loading && (
-                      <Loader2 data-icon="inline-start" className="animate-spin" />
-                    )}
-                    {loading ? "Computing…" : "Compute history"}
-                  </Button>
-                </form>
-                {error && (
-                  <p className="mt-3 text-sm text-destructive">{error}</p>
-                )}
-                {historyState && (
-                  <p className="mt-3 text-sm text-muted-foreground">
-                    Last analysed game #{historyState.last_game_id.toLocaleString()}{" "}
-                    at {formatSavedAt(historyState.last_computed_at)}. Highest saved
-                    game #{historyState.highest_game_id.toLocaleString()}.
-                  </p>
-                )}
-              </CardContent>
-            </Card>
+      <TooltipProvider>
+        <ProgressDialog open={loading} progress={progress} />
+        <div className="flex min-h-screen flex-col">
+          <Navbar page={page} onPageChange={setPage} />
+          {page === "tracker" ? (
+            <main className="flex flex-1 flex-col gap-4 p-4">
+              <Card className="w-full">
+                <CardHeader>
+                  <CardTitle>Bust Calculator</CardTitle>
+                  <CardDescription>
+                    Enter a classic-era game hash. Its game number is detected
+                    automatically and the full history is computed back to the start
+                    of the classic era.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <form
+                    className="flex flex-col gap-4 sm:flex-row sm:items-end"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      computeHistory();
+                    }}
+                  >
+                    <div className="flex flex-1 flex-col gap-2">
+                      <Label htmlFor="hash">Game hash</Label>
+                      <Input
+                        id="hash"
+                        placeholder="64-character hex hash"
+                        value={hash}
+                        onChange={(e) => setHash(e.target.value)}
+                      />
+                    </div>
+                    <Button type="submit" disabled={!canSubmit || loading}>
+                      {loading && (
+                        <Loader2 data-icon="inline-start" className="animate-spin" />
+                      )}
+                      {loading ? "Computing…" : "Compute history"}
+                    </Button>
+                  </form>
+                  {error && (
+                    <p className="mt-3 text-sm text-destructive">{error}</p>
+                  )}
+                  {historyState && (
+                    <p className="mt-3 text-sm text-muted-foreground">
+                      Last analysed game #{historyState.last_game_id.toLocaleString()}{" "}
+                      at {formatSavedAt(historyState.last_computed_at)}. Highest saved
+                      game #{historyState.highest_game_id.toLocaleString()}.
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
 
-            {prepared != null && layout != null && (
-              <DashboardSection
-                game={prepared.from_game}
-                layout={layout}
-                precomputed={prepared.results}
-                onLayoutChange={updateLayout}
-              />
-            )}
-          </main>
-        ) : (
-          <BacktesterPage />
-        )}
-      </div>
+              {prepared != null && layout != null && (
+                <DashboardSection
+                  game={prepared.from_game}
+                  layout={layout}
+                  precomputed={prepared.results}
+                  onLayoutChange={updateLayout}
+                />
+              )}
+            </main>
+          ) : (
+            <BacktesterPage />
+          )}
+        </div>
+      </TooltipProvider>
     </ThemeProvider>
   );
 }
