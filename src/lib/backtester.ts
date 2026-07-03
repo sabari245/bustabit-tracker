@@ -249,10 +249,8 @@ export class AutobetBacktestRunner {
         }
         if (this.queuedBet) throw new Error("A bet is already queued for the next game.");
         if (cleanWager > this.balance) {
-          this.stopped = true;
-          this.stopReason = `Insufficient balance to bet ${cleanWager / 100} bits`;
           if (this.logs.length < 500) {
-            this.logs.push(`stop: ${this.stopReason}`);
+            this.logs.push(`bet rejected: insufficient balance to bet ${cleanWager / 100} bits`);
           }
           return false;
         }
