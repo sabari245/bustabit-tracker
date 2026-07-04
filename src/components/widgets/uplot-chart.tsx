@@ -21,6 +21,22 @@ export type ChartMarker = {
   color?: string;
 };
 
+export type ChartEnvelope = {
+  /** Full-resolution x values, ascending. */
+  xs: ArrayLike<number>;
+  /** Full-resolution y values, same length as xs. */
+  ys: ArrayLike<number>;
+};
+
+export type ChartThreshold = {
+  y: number;
+  label?: string;
+  seriesKey?: string;
+  lineColor?: string;
+  aboveColor: string;
+  belowColor: string;
+};
+
 /** Resolve a colour that may be a `var(--x)` reference, against `el`'s computed style. */
 function resolveColor(el: Element, color: string): string {
   const m = color.match(/^var\((--[\w-]+)\)$/);
@@ -40,7 +56,7 @@ function withAlpha(color: string, a: number): string {
 function tooltipPlugin(
   series: Series[],
   colors: string[],
-  formatX?: (idx: number) => string,
+  formatX?: (u: uPlot, idx: number) => string,
 ): uPlot.Plugin {
   let tip: HTMLDivElement;
   const named = series.length > 1;
@@ -58,7 +74,7 @@ function tooltipPlugin(
           tip.style.display = "none";
           return;
         }
-        const heading = formatX?.(idx);
+        const heading = formatX?.(u, idx);
         const headingHtml = heading
           ? `<div class="mb-1 font-medium text-muted-foreground">${heading}</div>`
           : "";
@@ -104,6 +120,117 @@ function refLineHook(yVal: number, color: string) {
     ctx.lineTo(u.bbox.left + u.bbox.width, y);
     ctx.stroke();
     ctx.restore();
+  };
+}
+
+const ENVELOPE_BUCKETS = 1000;
+
+/** First index whose value is >= target (xs ascending). */
+function lowerBound(xs: ArrayLike<number>, target: number): number {
+  let lo = 0;
+  let hi = xs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Min/max envelope decimation of the [xmin, xmax] window: at most 2 points per
+ * bucket (the bucket's minimum and maximum, in x order), so extremes survive
+ * any zoom level. Once the visible window has fewer points than the budget the
+ * raw data is returned as-is — zooming in gradually reveals every point.
+ */
+function decimateEnvelope(
+  env: ChartEnvelope,
+  xmin: number,
+  xmax: number,
+  buckets: number,
+): [number[], number[]] {
+  const { xs, ys } = env;
+  const n = xs.length;
+  if (n === 0) return [[], []];
+  // Extend one point past each edge so the line enters/exits the viewport.
+  const i0 = Math.max(0, lowerBound(xs, xmin) - 1);
+  const i1 = Math.min(n - 1, lowerBound(xs, xmax));
+  const count = i1 - i0 + 1;
+  const outX: number[] = [];
+  const outY: number[] = [];
+  if (count <= buckets * 2) {
+    for (let i = i0; i <= i1; i++) {
+      outX.push(xs[i]);
+      outY.push(ys[i]);
+    }
+    return [outX, outY];
+  }
+  const size = count / buckets;
+  let prevIdx = -1;
+  const push = (i: number) => {
+    if (i === prevIdx) return;
+    prevIdx = i;
+    outX.push(xs[i]);
+    outY.push(ys[i]);
+  };
+  push(i0);
+  for (let b = 0; b < buckets; b++) {
+    const s = i0 + Math.floor(b * size);
+    const e = Math.min(i1, i0 + Math.floor((b + 1) * size) - 1);
+    let minIdx = s;
+    let maxIdx = s;
+    for (let i = s + 1; i <= e; i++) {
+      if (ys[i] < ys[minIdx]) minIdx = i;
+      if (ys[i] > ys[maxIdx]) maxIdx = i;
+    }
+    if (minIdx <= maxIdx) {
+      push(minIdx);
+      push(maxIdx);
+    } else {
+      push(maxIdx);
+      push(minIdx);
+    }
+  }
+  push(i1);
+  return [outX, outY];
+}
+
+/**
+ * Re-decimates a full-resolution single-series dataset whenever the x scale
+ * changes (wheel/drag/button zoom), and fits the y scale to the visible data.
+ * rAF-throttled so a burst of wheel events costs one rebuild per frame.
+ */
+function envelopePlugin(env: ChartEnvelope): uPlot.Plugin {
+  let raf = 0;
+  const rebuild = (u: uPlot) => {
+    const xmin = Number(u.scales.x.min ?? env.xs[0]);
+    const xmax = Number(u.scales.x.max ?? env.xs[env.xs.length - 1]);
+    const [dx, dy] = decimateEnvelope(env, xmin, xmax, ENVELOPE_BUCKETS);
+    u.setData([dx, dy], false);
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const v of dy) {
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    if (lo <= hi) {
+      const pad = Math.max((hi - lo) * 0.06, 1e-9);
+      u.setScale("y", { min: lo - pad, max: hi + pad });
+    }
+  };
+  return {
+    hooks: {
+      setScale: (u, key) => {
+        if (key !== "x" || raf) return;
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          rebuild(u);
+        });
+      },
+      destroy: () => {
+        if (raf) cancelAnimationFrame(raf);
+      },
+    },
   };
 }
 
@@ -253,6 +380,105 @@ function markersPlugin(markers: ChartMarker[], color: string): uPlot.Plugin {
   };
 }
 
+function drawSegment(
+  ctx: CanvasRenderingContext2D,
+  from: [number, number],
+  to: [number, number],
+) {
+  ctx.beginPath();
+  ctx.moveTo(from[0], from[1]);
+  ctx.lineTo(to[0], to[1]);
+  ctx.stroke();
+}
+
+function thresholdPlugin(
+  threshold: ChartThreshold,
+  seriesIdx: number,
+  lineColor: string,
+  aboveColor: string,
+  belowColor: string,
+): uPlot.Plugin {
+  return {
+    hooks: {
+      draw: (u) => {
+        const { ctx } = u;
+        const left = u.bbox.left;
+        const top = u.bbox.top;
+        const right = left + u.bbox.width;
+        const bottom = top + u.bbox.height;
+        const lineY = Math.round(u.valToPos(threshold.y, "y", true));
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, u.bbox.width, u.bbox.height);
+        ctx.clip();
+
+        if (lineY >= top && lineY <= bottom) {
+          ctx.strokeStyle = lineColor;
+          ctx.setLineDash([4, 4]);
+          ctx.lineWidth = 1;
+          drawSegment(ctx, [left, lineY], [right, lineY]);
+        }
+
+        const xs = u.data[0];
+        const ys = u.data[seriesIdx];
+        if (!ys) {
+          ctx.restore();
+          return;
+        }
+        ctx.setLineDash([]);
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        for (let i = 1; i < xs.length; i += 1) {
+          const x1Val = xs[i - 1];
+          const x2Val = xs[i];
+          const y1Val = ys[i - 1];
+          const y2Val = ys[i];
+          if (x1Val == null || x2Val == null || y1Val == null || y2Val == null) {
+            continue;
+          }
+
+          const x1 = u.valToPos(x1Val, "x", true);
+          const x2 = u.valToPos(x2Val, "x", true);
+          const y1 = u.valToPos(y1Val, "y", true);
+          const y2 = u.valToPos(y2Val, "y", true);
+          const startsAbove = y1Val >= threshold.y;
+          const endsAbove = y2Val >= threshold.y;
+
+          if (startsAbove === endsAbove || y1Val === y2Val) {
+            ctx.strokeStyle = startsAbove ? aboveColor : belowColor;
+            drawSegment(ctx, [x1, y1], [x2, y2]);
+            continue;
+          }
+
+          const t = (threshold.y - y1Val) / (y2Val - y1Val);
+          const crossX = x1 + (x2 - x1) * t;
+          const cross = [crossX, lineY] satisfies [number, number];
+
+          ctx.strokeStyle = startsAbove ? aboveColor : belowColor;
+          drawSegment(ctx, [x1, y1], cross);
+          ctx.strokeStyle = endsAbove ? aboveColor : belowColor;
+          drawSegment(ctx, cross, [x2, y2]);
+        }
+
+        ctx.restore();
+
+        if (threshold.label && lineY >= top && lineY <= bottom) {
+          ctx.save();
+          ctx.font = FONT;
+          ctx.fillStyle = lineColor;
+          ctx.textAlign = "right";
+          ctx.textBaseline = "bottom";
+          ctx.fillText(threshold.label, right - 4, lineY - 4);
+          ctx.restore();
+        }
+      },
+    },
+  };
+}
+
 /**
  * uPlot-backed chart. All layout/rendering runs on canvas outside React — the
  * component only mounts the instance and rebuilds it when its inputs (or the
@@ -266,6 +492,8 @@ export function UplotChart({
   numericX = false,
   interactive = false,
   markers = [],
+  threshold,
+  envelope,
 }: {
   widget: ChartWidgetSpec;
   data: Row[];
@@ -274,6 +502,10 @@ export function UplotChart({
   numericX?: boolean;
   interactive?: boolean;
   markers?: ChartMarker[];
+  threshold?: ChartThreshold;
+  /** Full-resolution data for a single-series line chart; the chart renders a
+   * min/max envelope and re-decimates on zoom. Overrides `data` for the series. */
+  envelope?: ChartEnvelope;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
@@ -295,27 +527,46 @@ export function UplotChart({
     if (!el) return;
     const css = (v: string) => resolveColor(el, v);
 
+    // Envelope mode: single-series line over full-resolution data, decimated
+    // per zoom window instead of pre-sampled rows.
+    const env = envelope && series.length === 1 && envelope.xs.length > 0 ? envelope : undefined;
+    const envInitial = env ? decimateEnvelope(env, -Infinity, Infinity, ENVELOPE_BUCKETS) : null;
+
     const n = data.length;
-    const xs = numericX
-      ? data.map((r, i) => chartNumber(r[x]) ?? i)
-      : data.map((_, i) => i);
+    const xs = envInitial
+      ? envInitial[0]
+      : numericX
+        ? data.map((r, i) => chartNumber(r[x]) ?? i)
+        : data.map((_, i) => i);
     const labels = data.map((r) => String(r[x] ?? ""));
     const colors = series.map((s) => css(s.color));
-    const aligned: uPlot.AlignedData = [
-      xs,
-      ...series.map((s) => data.map((r) => chartNumber(r[s.key]))),
-    ];
+    const aligned: uPlot.AlignedData = envInitial
+      ? envInitial
+      : [xs, ...series.map((s) => data.map((r) => chartNumber(r[s.key])))];
     const isBar = widget.type === "bar";
     const isArea = widget.type === "area";
-    const fullX: [number, number] = isBar
-      ? [-0.5, Math.max(0, n - 0.5)]
-      : numericX
-        ? [xs[0] ?? 0, xs[xs.length - 1] ?? 0]
-        : [0, Math.max(0, n - 1)];
+    const fullX: [number, number] = env
+      ? [Number(env.xs[0] ?? 0), Number(env.xs[env.xs.length - 1] ?? 0)]
+      : isBar
+        ? [-0.5, Math.max(0, n - 0.5)]
+        : numericX
+          ? [xs[0] ?? 0, xs[xs.length - 1] ?? 0]
+          : [0, Math.max(0, n - 1)];
     fullXRef.current = fullX;
 
     const muted = css("var(--muted-foreground)");
     const markerColor = css("var(--destructive)");
+    const thresholdLineColor = threshold?.lineColor
+      ? css(threshold.lineColor)
+      : muted;
+    const thresholdAboveColor = threshold ? css(threshold.aboveColor) : "";
+    const thresholdBelowColor = threshold ? css(threshold.belowColor) : "";
+    const thresholdSeriesIdx = threshold && series.length > 0
+      ? Math.max(
+          0,
+          series.findIndex((s) => !threshold.seriesKey || s.key === threshold.seriesKey),
+        )
+      : -1;
     const slot = 0.9 / series.length;
 
     // Grouped bars (general for any series count): split each unit-wide category
@@ -368,9 +619,12 @@ export function UplotChart({
           stroke: muted,
           grid: { show: false },
           ticks: { show: false },
-          splits: () => xSplits,
+          // Envelope data changes with zoom, so let uPlot pick round-number
+          // splits from the current scale instead of pinning them to the
+          // initial decimation.
+          ...(env ? {} : { splits: () => xSplits }),
           values: (_u, sp) =>
-            numericX
+            numericX || env
               ? sp.map((v) => Number(v).toLocaleString())
               : sp.map((i) => labels[i] ?? ""),
           label: widget.xTitle,
@@ -393,21 +647,36 @@ export function UplotChart({
         {},
         ...series.map((s, i) => ({
           label: s.label,
-          stroke: colors[i],
+          stroke: i === thresholdSeriesIdx ? "transparent" : colors[i],
           ...(isBar
             ? { paths: barPaths(i), fill: colors[i] }
             : isArea
               ? { width: 2, paths: uPlot.paths.spline!(), fill: withAlpha(colors[i], 0.2) }
-              : { width: 2, paths: uPlot.paths.spline!() }),
+              : {
+                  width: i === thresholdSeriesIdx ? 0 : 2,
+                  paths: uPlot.paths.spline!(),
+                }),
         })),
       ],
       plugins: [
-        tooltipPlugin(series, colors, (idx) =>
-          numericX
-            ? `${widget.xTitle ? `${widget.xTitle} ` : ""}${Number(xs[idx]).toLocaleString()}`
+        tooltipPlugin(series, colors, (u, idx) =>
+          numericX || env
+            ? `${widget.xTitle ? `${widget.xTitle} ` : ""}${Number(u.data[0][idx]).toLocaleString()}`
             : (labels[idx] ?? ""),
         ),
+        ...(env ? [envelopePlugin(env)] : []),
         ...(markers.length > 0 ? [markersPlugin(markers, markerColor)] : []),
+        ...(threshold && thresholdSeriesIdx >= 0
+          ? [
+              thresholdPlugin(
+                threshold,
+                thresholdSeriesIdx + 1,
+                thresholdLineColor,
+                thresholdAboveColor,
+                thresholdBelowColor,
+              ),
+            ]
+          : []),
         ...(interactive ? [interactionPlugin(fullX)] : []),
       ],
       hooks:
@@ -427,7 +696,7 @@ export function UplotChart({
       u.destroy();
       plotRef.current = null;
     };
-  }, [widget, data, x, series, numericX, interactive, markers, themeTick]);
+  }, [widget, data, x, series, numericX, interactive, markers, threshold, envelope, themeTick]);
 
   function control(action: "zoom-in" | "zoom-out" | "reset") {
     const plot = plotRef.current;

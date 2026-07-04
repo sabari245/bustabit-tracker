@@ -703,6 +703,10 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
              max_drawdown      INTEGER NOT NULL,\n\
              created_at        TEXT    NOT NULL,\n\
              result_json       TEXT    NOT NULL\n\
+         );\n\
+         CREATE TABLE IF NOT EXISTS backtest_series (\n\
+             backtest_id INTEGER PRIMARY KEY,\n\
+             data        BLOB    NOT NULL\n\
          );",
     )
     .await
@@ -1309,8 +1313,69 @@ async fn delete_backtest(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let conn = open_db_conn(&app).await?;
     conn.execute("DELETE FROM backtests WHERE id = ?1", libsql::params![id])
         .await
-        .map(|_| ())
-        .map_err(|e| format!("couldn't delete backtest: {e}"))
+        .map_err(|e| format!("couldn't delete backtest: {e}"))?;
+    conn.execute(
+        "DELETE FROM backtest_series WHERE backtest_id = ?1",
+        libsql::params![id],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("couldn't delete backtest series: {e}"))
+}
+
+/// Store the full-resolution balance series for a backtest as an opaque blob.
+/// The payload arrives as a raw IPC body (no JSON encoding — it's ~12 bytes per
+/// game); its first 4 bytes are the little-endian backtest id, the rest is the
+/// frontend's serialized series (see serializeFullSeries in src/lib/backtester.ts).
+#[tauri::command]
+async fn save_backtest_series(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected a raw binary payload".to_string());
+    };
+    if bytes.len() < 4 {
+        return Err("series payload too short".to_string());
+    }
+    let id = u32::from_le_bytes(bytes[0..4].try_into().expect("4-byte slice")) as i64;
+    let data = bytes[4..].to_vec();
+    let conn = open_db_conn(&app).await?;
+    conn.execute(
+        "INSERT OR REPLACE INTO backtest_series(backtest_id, data) VALUES (?1, ?2)",
+        libsql::params![id, data],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("couldn't save backtest series: {e}"))
+}
+
+/// Load a backtest's full-resolution balance series blob (empty response when
+/// the backtest predates series storage). Returned as raw bytes, not JSON.
+#[tauri::command]
+async fn load_backtest_series(
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<tauri::ipc::Response, String> {
+    let conn = open_db_conn(&app).await?;
+    let mut rows = conn
+        .query(
+            "SELECT data FROM backtest_series WHERE backtest_id = ?1",
+            libsql::params![id],
+        )
+        .await
+        .map_err(|e| format!("couldn't load backtest series: {e}"))?;
+    let data: Vec<u8> = match rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't load backtest series: {e}"))?
+    {
+        Some(r) => r
+            .get(0)
+            .map_err(|e| format!("couldn't load backtest series: {e}"))?,
+        None => Vec::new(),
+    };
+    Ok(tauri::ipc::Response::new(data))
 }
 
 #[tauri::command]
@@ -1569,6 +1634,8 @@ pub fn run() {
             load_backtest_cache_info,
             load_backtest_games,
             save_backtest,
+            save_backtest_series,
+            load_backtest_series,
             list_backtests,
             get_backtest,
             delete_backtest,

@@ -6,10 +6,12 @@ import {
   AutobetBacktestRunner,
   DEFAULT_BACKTEST_SCRIPT,
   bitsToSats,
+  deserializeFullSeries,
   formatBits,
   parseBacktestDetail,
   type BacktestPoint,
   type BacktestGame,
+  type FullBalanceSeries,
 } from "@/lib/backtester";
 import type { ChartWidgetSpec } from "@/lib/dashboard-spec";
 import type { Row } from "@/lib/query";
@@ -47,7 +49,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { UplotChart } from "@/components/widgets/uplot-chart";
+import {
+  UplotChart,
+  type ChartEnvelope,
+  type ChartMarker,
+} from "@/components/widgets/uplot-chart";
 
 const BATCH_SIZE = 50_000;
 
@@ -119,8 +125,31 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function EquityChart({ result }: { result: BacktestDetail }) {
+function EquityChart({
+  result,
+  fullSeries,
+}: {
+  result: BacktestDetail;
+  fullSeries: FullBalanceSeries | null;
+}) {
   const detail = useMemo(() => parseBacktestDetail(result.resultJson), [result.resultJson]);
+  // Full-resolution equity curve (one point per game, in bits): the chart
+  // decimates it to a min/max envelope per zoom window, so every drawdown
+  // spike is visible and zooming in eventually shows every game. Old
+  // backtests without a stored series fall back to the sampled points.
+  const envelope = useMemo<ChartEnvelope | undefined>(() => {
+    if (!fullSeries) return undefined;
+    const n = fullSeries.offsets.length;
+    const xs = new Float64Array(n + 1);
+    const ys = new Float64Array(n + 1);
+    xs[0] = 0;
+    ys[0] = result.startingBalance / 100;
+    for (let i = 0; i < n; i++) {
+      xs[i + 1] = fullSeries.offsets[i] + 1;
+      ys[i + 1] = fullSeries.balances[i] / 100;
+    }
+    return { xs, ys };
+  }, [fullSeries, result.startingBalance]);
   const initialGameId = result.startGameId > 0 ? result.startGameId - 1 : result.startGameId;
   const initialPoint: BacktestPoint = {
     gameId: initialGameId,
@@ -140,15 +169,43 @@ function EquityChart({ result }: { result: BacktestDetail }) {
     balance: p.balance / 100,
   }));
   const balanceSeries = EQUITY_CHART.series ?? [];
+  // Dashed vertical lines where the script would have stopped (the run itself
+  // keeps going). Same gameId → run-position mapping as the balance points
+  // above. No on-canvas labels — the reason is shown under the legend instead.
+  const stops = detail.stopMarkers.filter((m) => m.gameId >= result.startGameId);
+  const stopMarkers: ChartMarker[] = stops.map((m) => ({
+    x: m.gameId - result.startGameId + 1,
+    label: "",
+  }));
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
         <span className="flex items-center gap-2">
           <span className="h-0.5 w-6 rounded-full bg-chart-2" />
-          <span>Balance</span>
+          <span>Above starting balance</span>
         </span>
+        <span className="flex items-center gap-2">
+          <span className="h-0.5 w-6 rounded-full bg-destructive" />
+          <span>Below starting balance</span>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="w-6 border-t border-dashed border-muted-foreground" />
+          <span>Starting balance</span>
+        </span>
+        {stops.length > 0 && (
+          <span className="flex items-center gap-2">
+            <span className="w-6 border-t border-dashed border-destructive" />
+            <span>Script called stop()</span>
+          </span>
+        )}
       </div>
+      {stops.length > 0 && (
+        <p className="text-sm text-muted-foreground">
+          Would have stopped at game #{stops[0].gameId.toLocaleString()}: {stops[0].reason}
+          {stops.length > 1 && ` (+${stops.length - 1} more stop point${stops.length > 2 ? "s" : ""} — see logs)`}
+        </p>
+      )}
       <UplotChart
         widget={EQUITY_CHART}
         data={rows}
@@ -156,6 +213,15 @@ function EquityChart({ result }: { result: BacktestDetail }) {
         series={balanceSeries}
         numericX
         interactive
+        markers={stopMarkers}
+        envelope={envelope}
+        threshold={{
+          y: result.startingBalance / 100,
+          label: `Starting ${formatBits(result.startingBalance)} bits`,
+          seriesKey: "balance",
+          aboveColor: "var(--chart-2)",
+          belowColor: "var(--destructive)",
+        }}
       />
       <div className="grid gap-3 sm:grid-cols-3">
         <Metric
@@ -196,6 +262,7 @@ export function BacktesterPage() {
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
   const [rows, setRows] = useState<BacktestSummary[]>([]);
   const [selected, setSelected] = useState<BacktestDetail | null>(null);
+  const [selectedSeries, setSelectedSeries] = useState<FullBalanceSeries | null>(null);
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<BacktestProgress>({
@@ -226,6 +293,7 @@ export function BacktesterPage() {
   async function run() {
     setError(null);
     setSelected(null);
+    setSelectedSeries(null);
     setProgress({ current: 0, total: cacheInfo?.count ?? 0 });
     setRunning(true);
     try {
@@ -258,6 +326,8 @@ export function BacktesterPage() {
 
       const result = runner.result();
       const id = await invoke<number>("save_backtest", { input: result });
+      // Full-resolution balance series, sent as a raw binary body (id-prefixed).
+      await invoke<void>("save_backtest_series", runner.fullSeriesBytes(id));
       await refreshBacktests();
       await loadBacktest(id);
     } catch (e) {
@@ -270,7 +340,13 @@ export function BacktesterPage() {
   async function loadBacktest(id: number) {
     setError(null);
     const detail = await invoke<BacktestDetail | null>("get_backtest", { id });
+    let series: FullBalanceSeries | null = null;
+    if (detail) {
+      const buf = await invoke<ArrayBuffer>("load_backtest_series", { id });
+      if (buf.byteLength > 0) series = deserializeFullSeries(buf);
+    }
     setSelected(detail);
+    setSelectedSeries(series);
   }
 
   async function deleteBacktest() {
@@ -278,7 +354,10 @@ export function BacktesterPage() {
     setError(null);
     try {
       await invoke<void>("delete_backtest", { id: deleteId });
-      if (selected?.id === deleteId) setSelected(null);
+      if (selected?.id === deleteId) {
+        setSelected(null);
+        setSelectedSeries(null);
+      }
       setDeleteId(null);
       await refreshBacktests();
     } catch (e) {
@@ -434,7 +513,7 @@ export function BacktesterPage() {
                 <TabsTrigger value="script">Script</TabsTrigger>
               </TabsList>
               <TabsContent value="graph">
-                <EquityChart result={selected} />
+                <EquityChart result={selected} fullSeries={selectedSeries} />
               </TabsContent>
               <TabsContent value="summary">
                 <SummaryGrid result={selected} />

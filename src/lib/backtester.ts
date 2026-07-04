@@ -30,7 +30,12 @@ export type BacktestResult = {
 
 type Bet = {
   wager: number;
-  payout: number;
+  payoutCenti: number;
+};
+
+export type StopMarker = {
+  gameId: number;
+  reason: string;
 };
 
 type HistoryGame = BacktestGame & {
@@ -112,6 +117,7 @@ export type BacktestDetailJson = {
   maxDrawdownAt: BacktestPoint;
   stopped: boolean;
   stopReason: string;
+  stopMarkers: StopMarker[];
 };
 
 export const DEFAULT_BACKTEST_SCRIPT = `var config = {
@@ -147,6 +153,59 @@ function point(gameId: number, balance: number, startingBalance: number): Backte
   return { gameId, balance, profit: balance - startingBalance };
 }
 
+export type FullBalanceSeries = {
+  startGameId: number;
+  /** Per-game offset from startGameId (handles gaps in cached game ids). */
+  offsets: Uint32Array;
+  /** Balance in satoshis after each game, same length as offsets. */
+  balances: Float64Array;
+};
+
+const SERIES_VERSION = 1;
+const SERIES_HEADER_BYTES = 4 + 4 + 4 + 8; // id u32, version u32, count u32, startGameId f64
+
+/**
+ * Binary layout (little-endian): u32 backtest id, u32 version, u32 count,
+ * f64 startGameId, then count × u32 game-id offsets, count × f64 balances.
+ * The id prefix is consumed by the Rust save_backtest_series command; the
+ * rest is stored verbatim and round-trips through deserializeFullSeries.
+ */
+export function serializeFullSeries(
+  backtestId: number,
+  startGameId: number,
+  offsets: ArrayLike<number>,
+  balances: ArrayLike<number>,
+): Uint8Array {
+  const count = offsets.length;
+  const buf = new ArrayBuffer(SERIES_HEADER_BYTES + count * (4 + 8));
+  const view = new DataView(buf);
+  view.setUint32(0, backtestId, true);
+  view.setUint32(4, SERIES_VERSION, true);
+  view.setUint32(8, count, true);
+  view.setFloat64(12, startGameId, true);
+  let at = SERIES_HEADER_BYTES;
+  for (let i = 0; i < count; i++, at += 4) view.setUint32(at, offsets[i], true);
+  for (let i = 0; i < count; i++, at += 8) view.setFloat64(at, balances[i], true);
+  return new Uint8Array(buf);
+}
+
+/** Parse a blob from load_backtest_series (which strips the 4-byte id prefix). */
+export function deserializeFullSeries(buf: ArrayBuffer): FullBalanceSeries | null {
+  const headerBytes = SERIES_HEADER_BYTES - 4; // stored blob has no id prefix
+  if (buf.byteLength < headerBytes) return null;
+  const view = new DataView(buf);
+  const version = view.getUint32(0, true);
+  const count = view.getUint32(4, true);
+  if (version !== SERIES_VERSION || buf.byteLength < headerBytes + count * (4 + 8)) return null;
+  const startGameId = view.getFloat64(8, true);
+  const offsets = new Uint32Array(count);
+  const balances = new Float64Array(count);
+  let at = headerBytes;
+  for (let i = 0; i < count; i++, at += 4) offsets[i] = view.getUint32(at, true);
+  for (let i = 0; i < count; i++, at += 8) balances[i] = view.getFloat64(at, true);
+  return { startGameId, offsets, balances };
+}
+
 export function parseBacktestDetail(resultJson: string): BacktestDetailJson {
   const parsed = JSON.parse(resultJson) as Partial<BacktestDetailJson>;
   return {
@@ -158,6 +217,7 @@ export function parseBacktestDetail(resultJson: string): BacktestDetailJson {
     maxDrawdownAt: parsed.maxDrawdownAt ?? { gameId: 0, balance: 0, profit: 0 },
     stopped: parsed.stopped ?? false,
     stopReason: parsed.stopReason ?? "",
+    stopMarkers: parsed.stopMarkers ?? [],
   };
 }
 
@@ -177,6 +237,13 @@ export class AutobetBacktestRunner {
   private currentBet: Bet | null = null;
   private stopped = false;
   private stopReason = "";
+  private stopMarkers: StopMarker[] = [];
+  private lastStopGameIndex = Number.NEGATIVE_INFINITY;
+  // Full-resolution balance history (one entry per game), persisted separately
+  // as a binary blob so the chart can re-decimate on zoom. The sampled
+  // balanceSeries in the result JSON stays as a fallback for old backtests.
+  private fullOffsets: number[] = [];
+  private fullBalances: number[] = [];
   private startGameId = 0;
   private endGameId = 0;
   private games = 0;
@@ -235,20 +302,24 @@ export class AutobetBacktestRunner {
         this.engineEvents.removeListener(event, listener),
       off: (event: string, listener: Listener) => this.engineEvents.off(event, listener),
       bet: (wager: number, payout: number) => {
-        const cleanWager = Math.floor(Number(wager));
-        const cleanPayout = Number(payout);
-        if (!Number.isFinite(cleanWager) || cleanWager <= 0) {
-          throw new Error("engine.bet wager must be a positive integer.");
+        // Like real bustabit: wagers are whole bits (multiples of 100 satoshis)
+        // and payout targets are quantized to 0.01× steps, min 1.01×.
+        const cleanWager = Math.round(Number(wager));
+        const payoutCenti = Math.round(Number(payout) * 100);
+        if (!Number.isFinite(cleanWager) || cleanWager <= 0 || cleanWager % 100 !== 0) {
+          throw new Error(
+            "engine.bet wager must be a positive multiple of 100 satoshis (whole bits).",
+          );
         }
-        if (!Number.isFinite(cleanPayout) || cleanPayout <= 1) {
-          throw new Error("engine.bet payout must be greater than 1.");
+        if (!Number.isFinite(payoutCenti) || payoutCenti < 101) {
+          throw new Error("engine.bet payout must be at least 1.01.");
         }
         if (this.queuedBet) throw new Error("A bet is already queued for the next game.");
         // Balance is allowed to go negative — the backtest models a hypothetical
         // where every bet is always placed and the run covers the full history.
         this.balance -= cleanWager;
         this.wagered += cleanWager;
-        this.queuedBet = { wager: cleanWager, payout: cleanPayout };
+        this.queuedBet = { wager: cleanWager, payoutCenti };
         this.userEvents.emit("BALANCE_CHANGED");
         return true;
       },
@@ -264,6 +335,7 @@ export class AutobetBacktestRunner {
       cancelQueuedBet: () => {
         if (!this.queuedBet) return false;
         this.balance += this.queuedBet.wager;
+        this.wagered -= this.queuedBet.wager;
         this.queuedBet = null;
         this.userEvents.emit("BALANCE_CHANGED");
         return true;
@@ -279,11 +351,25 @@ export class AutobetBacktestRunner {
       if (this.notifications.length < 100) this.notifications.push(String(message));
       log("notify:", message);
     };
-    // The backtest always runs the entire cached history. stop() is kept so
-    // existing scripts don't error, but it no longer halts the run — it just
-    // notes the reason in the log.
+    // The backtest always runs the entire cached history. stop() doesn't halt
+    // the run — it records a marker (shown as a dashed vertical line on the
+    // equity chart) at the game where the strategy would have stopped.
     const stop = (reason?: unknown) => {
-      log("stop (ignored, running full history):", reason == null ? "Script stopped." : String(reason));
+      const message = reason == null ? "Script stopped." : String(reason);
+      if (!this.stopped) {
+        this.stopped = true;
+        this.stopReason = message;
+      }
+      // A real script halts at the first stop(), so a backtested strategy often
+      // re-triggers it every game after that. Only mark the start of each
+      // contiguous stop streak — that's where the strategy would have halted.
+      if (this.games > 0) {
+        if (this.games > this.lastStopGameIndex + 1 && this.stopMarkers.length < 100) {
+          this.stopMarkers.push({ gameId: this.endGameId, reason: message });
+        }
+        this.lastStopGameIndex = this.games;
+      }
+      log("stop (run continues):", message);
     };
 
     const fn = new Function(
@@ -312,16 +398,26 @@ ${script}
     }
   }
 
+  /** Binary blob (id-prefixed) for the save_backtest_series command. */
+  fullSeriesBytes(backtestId: number): Uint8Array {
+    return serializeFullSeries(backtestId, this.startGameId, this.fullOffsets, this.fullBalances);
+  }
+
   isStopped() {
     return this.stopped;
   }
 
   result(): BacktestResult {
     if (this.games === 0) throw new Error("No cached games are available to backtest.");
-    const last = this.balanceSeries[this.balanceSeries.length - 1];
-    if (!last || last.gameId !== this.endGameId) {
-      this.recordBalancePoint(point(this.endGameId, this.balance, this.startingBalance), true);
+    // A bet queued for a game that was never played (e.g. queued from the last
+    // GAME_ENDED handler) is refunded so it doesn't skew balance or wagered.
+    if (this.queuedBet) {
+      this.balance += this.queuedBet.wager;
+      this.wagered -= this.queuedBet.wager;
+      this.queuedBet = null;
+      this.fullBalances[this.fullBalances.length - 1] = this.balance;
     }
+    this.recordBalancePoint(point(this.endGameId, this.balance, this.startingBalance), true);
     const detail: BacktestDetailJson = {
       logs: this.logs,
       notifications: this.notifications,
@@ -331,6 +427,7 @@ ${script}
       maxDrawdownAt: this.maxDrawdownAt,
       stopped: this.stopped,
       stopReason: this.stopReason,
+      stopMarkers: this.stopMarkers,
     };
     return {
       name: this.name,
@@ -380,9 +477,13 @@ ${script}
     if (activeBet) {
       this.bets += 1;
       wager = activeBet.wager;
-      if (game.bust >= activeBet.payout) {
-        cashedAt = activeBet.payout;
-        this.balance += Math.floor(activeBet.wager * activeBet.payout);
+      // Settle in integer hundredths so float noise in the bust value or a
+      // script-computed payout can't flip a win into a loss or drop satoshis.
+      const bustCenti = Math.round(game.bust * 100);
+      if (bustCenti >= activeBet.payoutCenti) {
+        cashedAt = activeBet.payoutCenti / 100;
+        // wager is a multiple of 100, so this is an exact integer satoshi amount.
+        this.balance += (activeBet.wager / 100) * activeBet.payoutCenti;
         this.wins += 1;
         this.cashOuts = [{ uname: "backtest", wager: activeBet.wager, cashedAt }];
       } else {
@@ -397,6 +498,9 @@ ${script}
       wager,
       cashedAt,
     });
+
+    this.fullOffsets.push(game.gameId - this.startGameId);
+    this.fullBalances.push(this.balance);
 
     const p = point(game.gameId, this.balance, this.startingBalance);
     if (p.balance > this.peak.balance) this.peak = p;
