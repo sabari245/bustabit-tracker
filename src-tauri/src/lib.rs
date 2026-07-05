@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
 /// How often (in iterations) to emit a progress event during the walk. A power
@@ -21,6 +21,8 @@ const EXPORT_PROGRESS_MASK: u64 = 0x3FFF;
 /// `database is locked`. Startup and UI commands can overlap briefly, and
 /// history computation writes in batches, so a short timeout is too brittle.
 const DB_BUSY_TIMEOUT_MS: u64 = 30_000;
+
+const APP_META_VERSION_KEY: &str = "app_version";
 
 /// Rows per batched INSERT when filling the cache. Big enough that the per-
 /// statement overhead is negligible, small enough to keep the SQL string and
@@ -388,8 +390,105 @@ async fn open_db_conn(app: &tauri::AppHandle) -> Result<libsql::Connection, Stri
 }
 
 async fn init_database(app: &tauri::AppHandle) -> Result<(), String> {
-    let conn = open_db_conn(app).await?;
+    let path = db_path(app)?;
+    if should_reset_db_on_version_change() {
+        reset_database_if_app_version_changed(&path, current_app_version()).await?;
+    }
+
+    let conn = open_db_conn_at_path(path).await?;
     ensure_schema(&conn).await?;
+    write_app_meta_version(&conn, current_app_version()).await?;
+    Ok(())
+}
+
+fn current_app_version() -> &'static str {
+    option_env!("BUSTABIT_TRACKER_RELEASE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+fn should_reset_db_on_version_change() -> bool {
+    !cfg!(debug_assertions)
+}
+
+async fn reset_database_if_app_version_changed(
+    path: &Path,
+    current_version: &str,
+) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let stored_version = {
+        let conn = open_db_conn_at_path(path.to_path_buf()).await?;
+        read_app_meta_version(&conn).await?
+    };
+
+    if stored_version.as_deref() == Some(current_version) {
+        return Ok(());
+    }
+
+    delete_database_files(path)
+}
+
+fn delete_database_files(path: &Path) -> Result<(), String> {
+    let sidecars = [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ];
+
+    for file in sidecars {
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "couldn't delete database file {}: {e}",
+                    file.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn read_app_meta_version(conn: &libsql::Connection) -> Result<Option<String>, String> {
+    if !table_exists(conn, "app_meta").await? {
+        return Ok(None);
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT value FROM app_meta WHERE key = ?1",
+            libsql::params![APP_META_VERSION_KEY],
+        )
+        .await
+        .map_err(|e| format!("couldn't read app metadata: {e}"))?;
+
+    match rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't read app metadata: {e}"))?
+    {
+        Some(row) => {
+            Ok(Some(row.get(0).map_err(|e| {
+                format!("couldn't read app version metadata: {e}")
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn write_app_meta_version(
+    conn: &libsql::Connection,
+    current_version: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        libsql::params![APP_META_VERSION_KEY, current_version],
+    )
+    .await
+    .map_err(|e| format!("couldn't write app metadata: {e}"))?;
     Ok(())
 }
 
@@ -686,6 +785,10 @@ async fn ensure_schema(conn: &libsql::Connection) -> Result<(), String> {
              highest_game_id     INTEGER NOT NULL,\n\
              highest_computed_at TEXT    NOT NULL\n\
          );\n\
+         CREATE TABLE IF NOT EXISTS app_meta (\n\
+             key   TEXT PRIMARY KEY,\n\
+             value TEXT NOT NULL\n\
+         );\n\
          CREATE TABLE IF NOT EXISTS backtests (\n\
              id                INTEGER PRIMARY KEY AUTOINCREMENT,\n\
              name              TEXT    NOT NULL,\n\
@@ -784,6 +887,21 @@ async fn column_exists(conn: &libsql::Connection, table: &str, col: &str) -> Res
         }
     }
     Ok(false)
+}
+
+async fn table_exists(conn: &libsql::Connection, table: &str) -> Result<bool, String> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            libsql::params![table],
+        )
+        .await
+        .map_err(|e| format!("couldn't inspect schema: {e}"))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|e| format!("couldn't inspect schema: {e}"))?
+        .is_some())
 }
 
 /// Load the persisted history state, if the user has analysed at least one hash.
@@ -1682,6 +1800,114 @@ mod tests {
         let conn = db.connect().unwrap();
         ensure_schema(&conn).await.unwrap();
         conn
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bustabit-tracker-{name}-{unique}.db"))
+    }
+
+    async fn count_table_rows(conn: &libsql::Connection, table: &str) -> i64 {
+        let mut rows = conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get(0).unwrap()
+    }
+
+    async fn insert_game(conn: &libsql::Connection) {
+        conn.execute(
+            "INSERT INTO games (game_id, hash, bust_centi, is_green) VALUES (1, ?1, 200, 1)",
+            libsql::params![START],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_version_match_preserves_existing_data() {
+        let path = temp_db_path("same-version");
+        {
+            let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+            ensure_schema(&conn).await.unwrap();
+            write_app_meta_version(&conn, "1.2.3").await.unwrap();
+            insert_game(&conn).await;
+        }
+
+        reset_database_if_app_version_changed(&path, "1.2.3")
+            .await
+            .unwrap();
+        let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
+        assert_eq!(count_table_rows(&conn, "games").await, 1);
+
+        drop(conn);
+        delete_database_files(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn database_version_change_recreates_database() {
+        let path = temp_db_path("version-change");
+        {
+            let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+            ensure_schema(&conn).await.unwrap();
+            write_app_meta_version(&conn, "1.2.3").await.unwrap();
+            insert_game(&conn).await;
+        }
+
+        reset_database_if_app_version_changed(&path, "1.2.4")
+            .await
+            .unwrap();
+        let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
+        write_app_meta_version(&conn, "1.2.4").await.unwrap();
+        assert_eq!(count_table_rows(&conn, "games").await, 0);
+        assert_eq!(
+            read_app_meta_version(&conn).await.unwrap().as_deref(),
+            Some("1.2.4")
+        );
+
+        drop(conn);
+        delete_database_files(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_app_meta_table_recreates_database() {
+        let path = temp_db_path("missing-meta");
+        {
+            let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+            conn.execute_batch(
+                "CREATE TABLE games (
+                    game_id    INTEGER PRIMARY KEY,
+                    hash       TEXT    NOT NULL UNIQUE,
+                    bust_centi INTEGER NOT NULL,
+                    is_green   INTEGER NOT NULL
+                );
+                INSERT INTO games (game_id, hash, bust_centi, is_green)
+                VALUES (1, 'df5d54b8ca42cb40ea80e8ba74b3281f7b9d49bc27fecbe104847de1e91e4929', 200, 1);",
+            )
+            .await
+            .unwrap();
+        }
+
+        reset_database_if_app_version_changed(&path, "1.2.4")
+            .await
+            .unwrap();
+        let conn = open_db_conn_at_path(path.clone()).await.unwrap();
+        ensure_schema(&conn).await.unwrap();
+        write_app_meta_version(&conn, "1.2.4").await.unwrap();
+        assert_eq!(count_table_rows(&conn, "games").await, 0);
+        assert_eq!(
+            read_app_meta_version(&conn).await.unwrap().as_deref(),
+            Some("1.2.4")
+        );
+
+        drop(conn);
+        delete_database_files(&path).unwrap();
     }
 
     /// Run a query that returns a single integer in column `c`.
