@@ -20,6 +20,8 @@ export function TabsWidget({
   game: number;
   precomputed: Record<string, Row[]>;
 }) {
+  const onlyTab = widget.tabs.length === 1 ? widget.tabs[0] : null;
+
   return (
     <Card className="h-full">
       <CardHeader>
@@ -29,25 +31,34 @@ export function TabsWidget({
         )}
       </CardHeader>
       <CardContent>
-        <Tabs defaultValue={widget.tabs[0]?.value}>
-          <TabsList>
+        {onlyTab ? (
+          <ChartWidget
+            widget={onlyTab.chart}
+            game={game}
+            embedded
+            precomputed={precomputed[widgetId(widget.id ?? "", onlyTab.value)]}
+          />
+        ) : (
+          <Tabs defaultValue={widget.tabs[0]?.value}>
+            <TabsList>
+              {widget.tabs.map((t) => (
+                <TabsTrigger key={t.value} value={t.value}>
+                  {t.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
             {widget.tabs.map((t) => (
-              <TabsTrigger key={t.value} value={t.value}>
-                {t.label}
-              </TabsTrigger>
+              <TabsContent key={t.value} value={t.value}>
+                <ChartWidget
+                  widget={t.chart}
+                  game={game}
+                  embedded
+                  precomputed={precomputed[widgetId(widget.id ?? "", t.value)]}
+                />
+              </TabsContent>
             ))}
-          </TabsList>
-          {widget.tabs.map((t) => (
-            <TabsContent key={t.value} value={t.value}>
-              <ChartWidget
-                widget={t.chart}
-                game={game}
-                embedded
-                precomputed={precomputed[widgetId(widget.id ?? "", t.value)]}
-              />
-            </TabsContent>
-          ))}
-        </Tabs>
+          </Tabs>
+        )}
       </CardContent>
     </Card>
   );

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Copy, ExternalLink } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { Check, Copy } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -19,7 +18,7 @@ import {
 } from "@/components/ui/toggle-group";
 import { StatWidget } from "@/components/widgets/stat-widget";
 import { ChartWidget } from "@/components/widgets/chart-widget";
-import { AI_PROMPT, chatGptUrl } from "@/lib/ai-prompt";
+import { AI_PROMPT } from "@/lib/ai-prompt";
 import type { Widget } from "@/lib/dashboard-spec";
 import type { Row } from "@/lib/query";
 import { runQuery } from "@/lib/query";
@@ -143,9 +142,8 @@ export function ChartEditor({
         <DialogHeader>
           <DialogTitle>{editing ? "Edit widget" : "New widget"}</DialogTitle>
           <DialogDescription>
-            Let an assistant write it for you: copy the prompt (or open it
-            straight in ChatGPT), describe what you want, then paste the JSON it
-            replies with below.
+            Let an assistant write it for you: copy the prompt, describe what
+            you want, then paste the JSON it replies with below.
           </DialogDescription>
         </DialogHeader>
 
@@ -154,18 +152,6 @@ export function ChartEditor({
             {copied ? <Check /> : <Copy />}
             {copied ? "Copied!" : "Copy prompt"}
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={() => openUrl(chatGptUrl())}
-          >
-            <ExternalLink />
-            Open in ChatGPT
-          </Button>
-          <span className="text-xs text-muted-foreground">
-            Opens a new chat with the prompt already filled in.
-          </span>
         </div>
 
         <div className="flex flex-col gap-2">

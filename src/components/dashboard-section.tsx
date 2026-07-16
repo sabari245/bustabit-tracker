@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
-import { Check, Download, Loader2, Plus } from "lucide-react";
+import { Check, Download, Loader2, Plus, RotateCcw } from "lucide-react";
 
 import {
   AlertDialog,
@@ -15,6 +15,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -40,10 +41,18 @@ import {
   findWidget,
   removeWidget,
   replaceWidget,
+  seedLayout,
   widgetId,
 } from "@/lib/layout";
 
-type ExportRange = "100" | "1000" | "10000" | "all";
+type ExportRange =
+  | "100"
+  | "1000"
+  | "5000"
+  | "10000"
+  | "100000"
+  | "custom"
+  | "all";
 
 type CacheInfo = {
   count: number;
@@ -54,7 +63,9 @@ type CacheInfo = {
 const EXPORT_RANGES: { value: ExportRange; label: string }[] = [
   { value: "100", label: "100" },
   { value: "1000", label: "1,000" },
+  { value: "5000", label: "5,000" },
   { value: "10000", label: "10,000" },
+  { value: "100000", label: "100,000" },
   { value: "all", label: "All" },
 ];
 
@@ -77,12 +88,14 @@ export function DashboardSection({
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Widget | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exported, setExported] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportRangeOpen, setExportRangeOpen] = useState(false);
   const [exportRange, setExportRange] = useState<ExportRange>("1000");
+  const [exportRowLimit, setExportRowLimit] = useState("1000");
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
   const [cacheInfoLoading, setCacheInfoLoading] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress>({
@@ -106,16 +119,29 @@ export function DashboardSection({
     }
   }
 
+  useEffect(() => {
+    if (exportRange === "all" && cacheInfo != null) {
+      setExportRowLimit(String(cacheInfo.count));
+    }
+  }, [cacheInfo?.count, exportRange]);
+
   const selectedLimit =
-    exportRange === "all" ? null : Number.parseInt(exportRange, 10);
-  const selectedRows =
-    cacheInfo == null
+    exportRowLimit === "" ||
+    !Number.isSafeInteger(Number(exportRowLimit)) ||
+    Number(exportRowLimit) < 1
       ? null
-      : selectedLimit == null
-        ? cacheInfo.count
-        : Math.min(cacheInfo.count, selectedLimit);
+      : Number(exportRowLimit);
+  const selectedRows =
+    cacheInfo == null || selectedLimit == null
+      ? null
+      : Math.min(cacheInfo.count, selectedLimit);
   const canExportSelected =
-    !exporting && !cacheInfoLoading && cacheInfo != null && cacheInfo.count > 0;
+    !exporting &&
+    !cacheInfoLoading &&
+    cacheInfo != null &&
+    cacheInfo.count > 0 &&
+    selectedRows != null &&
+    selectedRows > 0;
 
   // Save the selected cached game history range to an .xlsx file the user picks.
   // The workbook itself is built in Rust (see the `export_history` command).
@@ -203,6 +229,12 @@ export function DashboardSection({
     setDeleteId(null);
   }
 
+  function resetLayout() {
+    setPre({});
+    onLayoutChange(seedLayout());
+    setResetOpen(false);
+  }
+
   const renderItem = (w: Widget): ReactNode => {
     const id = w.id ?? "";
     if (w.kind === "stat") {
@@ -237,6 +269,10 @@ export function DashboardSection({
           <Button size="sm" onClick={openNew}>
             <Plus data-icon="inline-start" />
             Add chart
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setResetOpen(true)}>
+            <RotateCcw data-icon="inline-start" />
+            Reset layout
           </Button>
         </div>
       </div>
@@ -300,7 +336,15 @@ export function DashboardSection({
               variant="outline"
               value={exportRange}
               onValueChange={(value) => {
-                if (value) setExportRange(value as ExportRange);
+                if (!value) return;
+                setExportRange(value as ExportRange);
+                setExportRowLimit(
+                  value === "all" && cacheInfo != null
+                    ? String(cacheInfo.count)
+                    : value === "all"
+                      ? ""
+                      : value,
+                );
               }}
             >
               {EXPORT_RANGES.map((option) => (
@@ -309,6 +353,28 @@ export function DashboardSection({
                 </ToggleGroupItem>
               ))}
             </ToggleGroup>
+
+            <Input
+              id="custom-export-range"
+              type="number"
+              min="1"
+              step="1"
+              inputMode="numeric"
+              placeholder="Custom number of games"
+              aria-label="Custom number of games"
+              value={exportRowLimit}
+              onFocus={() => setExportRange("custom")}
+              onChange={(event) => {
+                setExportRange("custom");
+                setExportRowLimit(event.target.value);
+              }}
+              aria-invalid={exportRowLimit !== "" && selectedLimit == null}
+            />
+            {exportRowLimit !== "" && selectedLimit == null && (
+                <p className="text-sm text-destructive">
+                  Enter a whole number greater than zero.
+                </p>
+              )}
 
             {selectedRows != null && cacheInfo && cacheInfo.count > 0 && (
               <p className="text-sm text-muted-foreground">
@@ -339,6 +405,22 @@ export function DashboardSection({
         open={exportDialogOpen}
         progress={exportProgress}
       />
+
+      <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Reset dashboard layout?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This restores the default charts and arrangement. Custom charts and
+              layout changes will be removed, but cached game data is not affected.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={resetLayout}>Reset layout</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={deleteId != null}

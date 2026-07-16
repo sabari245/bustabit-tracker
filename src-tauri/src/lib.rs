@@ -1,6 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use hmac::{Hmac, Mac};
-use rust_xlsxwriter::{Color, Format, FormatBorder, Workbook};
+use rust_xlsxwriter::{Color, Format, FormatBorder, Workbook, XlsxError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -1642,7 +1642,7 @@ async fn get_backtest(
 }
 
 /// Export cached game history to an `.xlsx` file at `path`. The selected range of
-/// the `games` table is written — game number, provably-fair hash, the bust multiplier
+/// the `games` table is written — game number, a link to the game, the bust multiplier
 /// (centi → real ×), and the 2× green/red result — under a titled, frozen header.
 /// History larger than one Excel sheet is split across consecutive sheets. Streams
 /// rows straight from libSQL into the workbook (keyset-paginated by game_id) so the
@@ -1689,8 +1689,46 @@ async fn export_history(
                 .set_bold()
                 .set_background_color(Color::RGB(0xF2F2F2))
                 .set_border_bottom(FormatBorder::Thin);
-            let mult_fmt = Format::new().set_num_format("0.00");
-            let headers = ["Game #", "Hash", "Bust Multiplier (x)", "Result"];
+            // Muted backgrounds keep the value bands distinct without using the
+            // harsh, fully saturated red and green from Excel's default palette.
+            // Font colors are paired for readable contrast on each background.
+            let multiplier_formats = [
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0x7A3034))
+                    .set_font_color(Color::RGB(0xFFFFFF)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0xDFA6A3))
+                    .set_font_color(Color::RGB(0x542326)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0xF3D6D2))
+                    .set_font_color(Color::RGB(0x613330)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0xDDE8D2))
+                    .set_font_color(Color::RGB(0x34452D)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0xA8C596))
+                    .set_font_color(Color::RGB(0x20381E)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0x52735A))
+                    .set_font_color(Color::RGB(0xFFFFFF)),
+                Format::new()
+                    .set_num_format("0.00")
+                    .set_background_color(Color::RGB(0x294F3D))
+                    .set_font_color(Color::RGB(0xFFFFFF)),
+            ];
+            let green_result_fmt = Format::new()
+                .set_background_color(Color::RGB(0xE5EDDE))
+                .set_font_color(Color::RGB(0x3D5136));
+            let red_result_fmt = Format::new()
+                .set_background_color(Color::RGB(0xF5E3E1))
+                .set_font_color(Color::RGB(0x713D39));
+            let headers = ["Game #", "Game URL", "Bust Multiplier (x)", "Result"];
 
             let sheets = if total == 0 {
                 1
@@ -1714,7 +1752,7 @@ async fn export_history(
                     .set_name(&name)
                     .map_err(|e| format!("couldn't create sheet: {e}"))?;
                 sheet.set_column_width(0, 12.0).ok();
-                sheet.set_column_width(1, 66.0).ok();
+                sheet.set_column_width(1, 38.0).ok();
                 sheet.set_column_width(2, 18.0).ok();
                 sheet.set_column_width(3, 12.0).ok();
 
@@ -1758,7 +1796,7 @@ async fn export_history(
                 let mut data_row = header_row + 1;
                 let mut rows = conn
                     .query(
-                        "SELECT game_id, hash, bust_centi, is_green FROM games \
+                        "SELECT game_id, bust_centi, is_green FROM games \
                          WHERE game_id >= ?1 AND game_id > ?2 \
                          ORDER BY game_id LIMIT ?3",
                         libsql::params![min_game_id, last_id, XLSX_ROWS_PER_SHEET as i64],
@@ -1772,22 +1810,41 @@ async fn export_history(
                     .map_err(|e| format!("export read failed: {e}"))?
                 {
                     let gid: i64 = r.get(0).map_err(|e| format!("export read failed: {e}"))?;
-                    let hash: String = r.get(1).map_err(|e| format!("export read failed: {e}"))?;
                     let bust_centi: i64 =
-                        r.get(2).map_err(|e| format!("export read failed: {e}"))?;
-                    let is_green: i64 = r.get(3).map_err(|e| format!("export read failed: {e}"))?;
+                        r.get(1).map_err(|e| format!("export read failed: {e}"))?;
+                    let is_green: i64 = r.get(2).map_err(|e| format!("export read failed: {e}"))?;
+                    let multiplier_format = match bust_centi {
+                        ..110 => &multiplier_formats[0],
+                        110..150 => &multiplier_formats[1],
+                        150..200 => &multiplier_formats[2],
+                        200..300 => &multiplier_formats[3],
+                        300..500 => &multiplier_formats[4],
+                        500..1000 => &multiplier_formats[5],
+                        _ => &multiplier_formats[6],
+                    };
+                    let (result, result_format) = if is_green != 0 {
+                        ("Green", &green_result_fmt)
+                    } else {
+                        ("Red", &red_result_fmt)
+                    };
 
+                    let game_url = format!("https://bustabit.com/game/{gid}");
                     sheet
                         .write_number(data_row, 0, gid as f64)
                         .map_err(|e| format!("write failed: {e}"))?;
                     sheet
-                        .write_string(data_row, 1, &hash)
+                        .write_url(data_row, 1, game_url.as_str())
                         .map_err(|e| format!("write failed: {e}"))?;
                     sheet
-                        .write_number_with_format(data_row, 2, bust_centi as f64 / 100.0, &mult_fmt)
+                        .write_number_with_format(
+                            data_row,
+                            2,
+                            bust_centi as f64 / 100.0,
+                            multiplier_format,
+                        )
                         .map_err(|e| format!("write failed: {e}"))?;
                     sheet
-                        .write_string(data_row, 3, if is_green != 0 { "Green" } else { "Red" })
+                        .write_string_with_format(data_row, 3, result, result_format)
                         .map_err(|e| format!("write failed: {e}"))?;
 
                     data_row += 1;
@@ -1800,9 +1857,13 @@ async fn export_history(
             }
 
             report("saving", written, total);
-            workbook
-                .save(&path)
-                .map_err(|e| format!("couldn't write xlsx: {e}"))?;
+            workbook.save(&path).map_err(|e| match e {
+                XlsxError::IoError(ref error) if error.raw_os_error() == Some(32) => {
+                    "Couldn't write the XLSX file because it is open in another application. Close Excel, then re-export the file."
+                        .to_string()
+                }
+                _ => format!("couldn't write xlsx: {e}"),
+            })?;
             report("completed", written, total);
             Ok(written)
         })

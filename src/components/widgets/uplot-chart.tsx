@@ -37,6 +37,8 @@ export type ChartThreshold = {
   belowColor: string;
 };
 
+
+
 /** Resolve a colour that may be a `var(--x)` reference, against `el`'s computed style. */
 function resolveColor(el: Element, color: string): string {
   const m = color.match(/^var\((--[\w-]+)\)$/);
@@ -57,6 +59,7 @@ function tooltipPlugin(
   series: Series[],
   colors: string[],
   formatX?: (u: uPlot, idx: number) => string,
+  pointColors?: string[],
 ): uPlot.Plugin {
   let tip: HTMLDivElement;
   const named = series.length > 1;
@@ -87,8 +90,9 @@ function tooltipPlugin(
             const name = named
               ? `<span class="text-muted-foreground">${s.label}</span>`
               : "";
+            const pointColor = pointColors?.[idx] ?? colors[i];
             return `<div class="flex w-full items-center justify-between gap-2">
-              <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 shrink-0 rounded-[2px]" style="background:${colors[i]}"></span>${name}</span>
+              <span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 shrink-0 rounded-[2px]" style="background:${pointColor}"></span>${name}</span>
               <span class="font-mono font-medium tabular-nums">${v.toLocaleString()}</span>
             </div>`;
           })
@@ -380,6 +384,46 @@ function markersPlugin(markers: ChartMarker[], color: string): uPlot.Plugin {
   };
 }
 
+function coloredPointsPlugin(
+  pointColors: string[],
+  seriesIdx: number,
+): uPlot.Plugin {
+  return {
+    hooks: {
+      draw: (u) => {
+        const xs = u.data[0];
+        const ys = u.data[seriesIdx];
+        if (!ys) return;
+
+        const { ctx } = u;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+        ctx.clip();
+
+        for (let i = 0; i < xs.length; i += 1) {
+          const xVal = xs[i];
+          const yVal = ys[i];
+          if (xVal == null || yVal == null) continue;
+
+          ctx.fillStyle = pointColors[i] ?? pointColors[0];
+          ctx.beginPath();
+          ctx.arc(
+            u.valToPos(xVal, "x", true),
+            u.valToPos(yVal, "y", true),
+            4,
+            0,
+            Math.PI * 2,
+          );
+          ctx.fill();
+        }
+
+        ctx.restore();
+      },
+    },
+  };
+}
+
 function drawSegment(
   ctx: CanvasRenderingContext2D,
   from: [number, number],
@@ -561,6 +605,17 @@ export function UplotChart({
       : muted;
     const thresholdAboveColor = threshold ? css(threshold.aboveColor) : "";
     const thresholdBelowColor = threshold ? css(threshold.belowColor) : "";
+    const pointColors = widget.alternatingPointColors
+      ? data.map((row, i) => {
+          const position = chartNumber(row[x]) ?? i + 1;
+          return Math.abs(position) % 2 === 1
+            ? css(widget.alternatingPointColors!.oddColor)
+            : css(widget.alternatingPointColors!.evenColor);
+        })
+      : undefined;
+    const pointLineColor = widget.alternatingPointColors
+      ? css(widget.alternatingPointColors.lineColor ?? "var(--muted-foreground)")
+      : "";
     const thresholdSeriesIdx = threshold && series.length > 0
       ? Math.max(
           0,
@@ -647,7 +702,12 @@ export function UplotChart({
         {},
         ...series.map((s, i) => ({
           label: s.label,
-          stroke: i === thresholdSeriesIdx ? "transparent" : colors[i],
+          stroke:
+            i === thresholdSeriesIdx
+              ? "transparent"
+              : pointColors
+                ? pointLineColor
+                : colors[i],
           ...(isBar
             ? { paths: barPaths(i), fill: colors[i] }
             : isArea
@@ -659,12 +719,19 @@ export function UplotChart({
         })),
       ],
       plugins: [
-        tooltipPlugin(series, colors, (u, idx) =>
-          numericX || env
-            ? `${widget.xTitle ? `${widget.xTitle} ` : ""}${Number(u.data[0][idx]).toLocaleString()}`
-            : (labels[idx] ?? ""),
+        tooltipPlugin(
+          series,
+          colors,
+          (u, idx) =>
+            numericX || env
+              ? `${widget.xTitle ? `${widget.xTitle} ` : ""}${Number(u.data[0][idx]).toLocaleString()}`
+              : (labels[idx] ?? ""),
+          pointColors,
         ),
         ...(env ? [envelopePlugin(env)] : []),
+        ...(pointColors
+          ? series.map((_, i) => coloredPointsPlugin(pointColors, i + 1))
+          : []),
         ...(markers.length > 0 ? [markersPlugin(markers, markerColor)] : []),
         ...(threshold && thresholdSeriesIdx >= 0
           ? [

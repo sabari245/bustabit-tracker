@@ -43,6 +43,12 @@ export type ChartWidgetSpec = {
   xTitle?: string;
   yTitle?: string;
   refLine?: number;
+  /** Color points by odd/even x position while keeping the line neutral. */
+  alternatingPointColors?: {
+    oddColor: string;
+    evenColor: string;
+    lineColor?: string;
+  };
   yUnit?: string;
   yDomain?: [number, number];
 };
@@ -165,10 +171,10 @@ export const DASHBOARD: DashboardSpec = {
         },
         {
           kind: "stat",
-          title: "Instant busts",
+          title: "Red rate",
           format: "pct",
-          hint: "1.00× · {g} games",
-          sql: "SELECT 100.0 * SUM(bust_centi <= 100) / COUNT(*) AS value, SUM(bust_centi <= 100) AS g FROM games WHERE game_id <= ?1",
+          hint: "<2× · {g} games",
+          sql: "SELECT 100.0 * SUM(is_green = 0) / COUNT(*) AS value, SUM(is_green = 0) AS g FROM games WHERE game_id <= ?1",
         },
         {
           kind: "stat",
@@ -186,90 +192,30 @@ export const DASHBOARD: DashboardSpec = {
         },
         {
           kind: "stat",
-          title: "Current streak",
-          format: "text",
-          hint: "at the entered game",
-          sql: `${RUNS}
-                SELECT printf('%d %s', len, CASE WHEN green = 1 THEN 'green' ELSE 'red' END) AS value
-                FROM runs WHERE hi = ?1`,
+          title: "Red alternating streak",
+          format: "int",
+          hint: "consecutive red/green games",
+          sql: `${ALT_RUNS} SELECT COALESCE(MAX(len), 0) AS value FROM runs WHERE start_green = 0`,
         },
         {
           kind: "stat",
-          title: "Mean bust",
-          format: "mult",
-          hint: "average multiplier",
-          sql: "SELECT AVG(bust_centi) / 100.0 AS value FROM games WHERE game_id <= ?1",
+          title: "Green alternating streak",
+          format: "int",
+          hint: "consecutive green/red games",
+          sql: `${ALT_RUNS} SELECT COALESCE(MAX(len), 0) AS value FROM runs WHERE start_green = 1`,
         },
       ],
     },
+
     {
-      widgets: [
-        {
-          kind: "chart",
-          type: "bar",
-          title: "Bust distribution",
-          description: "How often each multiplier range hits",
-          x: "label",
-          series: [{ key: "count", label: "Games", color: "var(--chart-1)" }],
-          sql: `WITH d AS (
-                  SELECT
-                    SUM(bust_centi < 200) AS b0,
-                    SUM(bust_centi >= 200 AND bust_centi < 500) AS b1,
-                    SUM(bust_centi >= 500 AND bust_centi < 1000) AS b2,
-                    SUM(bust_centi >= 1000 AND bust_centi < 10000) AS b3,
-                    SUM(bust_centi >= 10000) AS b4
-                  FROM games WHERE game_id <= ?1
-                )
-                SELECT label, count FROM (
-                  SELECT '<2×' AS label, 0 AS ord, b0 AS count FROM d
-                  UNION ALL SELECT '2–5×', 1, b1 FROM d
-                  UNION ALL SELECT '5–10×', 2, b2 FROM d
-                  UNION ALL SELECT '10–100×', 3, b3 FROM d
-                  UNION ALL SELECT '≥100×', 4, b4 FROM d
-                ) ORDER BY ord`,
-        },
-      ],
-    },
-    {
-      // Dedicated red-streak analysis, three views in tabs.
+      // Red and green continuation analysis share a row.
       widgets: [
         {
           kind: "tabs",
           title: "Red streaks",
           description: "Runs of consecutive games below 2×",
           tabs: [
-            {
-              value: "frequency",
-              label: "Frequency",
-              chart: {
-                kind: "chart",
-                type: "bar",
-                title: "Frequency",
-                note: "How many red streaks were exactly this many games long.",
-                x: "length",
-                series: [{ key: "count", label: "Red streaks", color: RED }],
-                sql: `${RED_HIST} SELECT length, count FROM rs ORDER BY length`,
-              },
-            },
-            {
-              value: "survival",
-              label: "Survival",
-              chart: {
-                kind: "chart",
-                type: "area",
-                title: "Survival",
-                note: "Of all red streaks, the % that reached at least this length.",
-                x: "length",
-                yUnit: "%",
-                yDomain: [0, 100],
-                series: [{ key: "pct", label: "Reached ≥ length", color: RED }],
-                sql: `${RED_HIST},
-                      tot AS (SELECT SUM(count) AS s FROM rs)
-                      SELECT length,
-                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
-                      FROM rs ORDER BY length`,
-              },
-            },
+
             {
               value: "continuation",
               label: "Continuation",
@@ -292,48 +238,13 @@ export const DASHBOARD: DashboardSpec = {
             },
           ],
         },
-      ],
-    },
-    {
-      // Dedicated green-streak analysis, mirroring the red-streak views.
-      widgets: [
         {
+          // Green-streak analysis mirrors the red-streak views in the same row.
           kind: "tabs",
           title: "Green streaks",
           description: "Runs of consecutive games at or above 2×",
           tabs: [
-            {
-              value: "frequency",
-              label: "Frequency",
-              chart: {
-                kind: "chart",
-                type: "bar",
-                title: "Frequency",
-                note: "How many green streaks were exactly this many games long.",
-                x: "length",
-                series: [{ key: "count", label: "Green streaks", color: GREEN }],
-                sql: `${GREEN_HIST} SELECT length, count FROM gs ORDER BY length`,
-              },
-            },
-            {
-              value: "survival",
-              label: "Survival",
-              chart: {
-                kind: "chart",
-                type: "area",
-                title: "Survival",
-                note: "Of all green streaks, the % that reached at least this length.",
-                x: "length",
-                yUnit: "%",
-                yDomain: [0, 100],
-                series: [{ key: "pct", label: "Reached ≥ length", color: GREEN }],
-                sql: `${GREEN_HIST},
-                      tot AS (SELECT SUM(count) AS s FROM gs)
-                      SELECT length,
-                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
-                      FROM gs ORDER BY length`,
-              },
-            },
+
             {
               value: "continuation",
               label: "Continuation",
@@ -359,45 +270,13 @@ export const DASHBOARD: DashboardSpec = {
       ],
     },
     {
-      // Alternating R-G-R-G... runs, three views in tabs.
+      // Red-start and green-start alternating continuation analysis share a row.
       widgets: [
         {
           kind: "tabs",
           title: "Alternating streaks (red start)",
           description: "Runs that alternate below 2×, at least 2×, below 2×...",
           tabs: [
-            {
-              value: "frequency",
-              label: "Frequency",
-              chart: {
-                kind: "chart",
-                type: "bar",
-                title: "Frequency",
-                note: "How many alternating streaks started red and were exactly this many games long.",
-                x: "length",
-                series: [{ key: "count", label: "Red-start alternations", color: RED }],
-                sql: `${RED_ALT_HIST} SELECT length, count FROM ars ORDER BY length`,
-              },
-            },
-            {
-              value: "survival",
-              label: "Survival",
-              chart: {
-                kind: "chart",
-                type: "area",
-                title: "Survival",
-                note: "Of all red-start alternating streaks, the % that reached at least this length.",
-                x: "length",
-                yUnit: "%",
-                yDomain: [0, 100],
-                series: [{ key: "pct", label: "Reached ≥ length", color: RED }],
-                sql: `${RED_ALT_HIST},
-                      tot AS (SELECT SUM(count) AS s FROM ars)
-                      SELECT length,
-                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
-                      FROM ars ORDER BY length`,
-              },
-            },
             {
               value: "continuation",
               label: "Continuation",
@@ -410,6 +289,11 @@ export const DASHBOARD: DashboardSpec = {
                 yUnit: "%",
                 yDomain: [0, 100],
                 refLine: 50,
+                alternatingPointColors: {
+                  oddColor: RED,
+                  evenColor: GREEN,
+                  lineColor: "var(--muted-foreground)",
+                },
                 series: [{ key: "pct", label: "Continued to next", color: RED }],
                 sql: `${RED_ALT_HIST},
                       s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM ars)
@@ -420,48 +304,11 @@ export const DASHBOARD: DashboardSpec = {
             },
           ],
         },
-      ],
-    },
-    {
-      // Alternating G-R-G-R... runs, three views in tabs.
-      widgets: [
         {
           kind: "tabs",
           title: "Alternating streaks (green start)",
           description: "Runs that alternate at least 2×, below 2×, at least 2×...",
           tabs: [
-            {
-              value: "frequency",
-              label: "Frequency",
-              chart: {
-                kind: "chart",
-                type: "bar",
-                title: "Frequency",
-                note: "How many alternating streaks started green and were exactly this many games long.",
-                x: "length",
-                series: [{ key: "count", label: "Green-start alternations", color: GREEN }],
-                sql: `${GREEN_ALT_HIST} SELECT length, count FROM ags ORDER BY length`,
-              },
-            },
-            {
-              value: "survival",
-              label: "Survival",
-              chart: {
-                kind: "chart",
-                type: "area",
-                title: "Survival",
-                note: "Of all green-start alternating streaks, the % that reached at least this length.",
-                x: "length",
-                yUnit: "%",
-                yDomain: [0, 100],
-                series: [{ key: "pct", label: "Reached ≥ length", color: GREEN }],
-                sql: `${GREEN_ALT_HIST},
-                      tot AS (SELECT SUM(count) AS s FROM ags)
-                      SELECT length,
-                             ROUND(100.0 * SUM(count) OVER (ORDER BY length DESC) / (SELECT s FROM tot), 2) AS pct
-                      FROM ags ORDER BY length`,
-              },
-            },
             {
               value: "continuation",
               label: "Continuation",
@@ -474,6 +321,11 @@ export const DASHBOARD: DashboardSpec = {
                 yUnit: "%",
                 yDomain: [0, 100],
                 refLine: 50,
+                alternatingPointColors: {
+                  oddColor: GREEN,
+                  evenColor: RED,
+                  lineColor: "var(--muted-foreground)",
+                },
                 series: [{ key: "pct", label: "Continued to next", color: GREEN }],
                 sql: `${GREEN_ALT_HIST},
                       s AS (SELECT length, SUM(count) OVER (ORDER BY length DESC) AS atleast FROM ags)

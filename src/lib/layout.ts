@@ -117,6 +117,29 @@ function appendDefaultWidget(spec: DashboardSpec, title: string): {
   };
 }
 
+/** Refresh a non-editable built-in widget while preserving its saved position and id. */
+function refreshDefaultWidget(spec: DashboardSpec, title: string): {
+  spec: DashboardSpec;
+  changed: boolean;
+} {
+  const defaultWidget = findDefaultWidget(title);
+  if (!defaultWidget) return { spec, changed: false };
+
+  let changed = false;
+  const rows = spec.rows.map((row) => ({
+    ...row,
+    widgets: row.widgets.map((widget) => {
+      if (!("title" in widget) || widget.title !== title) return widget;
+      const replacement = { ...clone(defaultWidget), id: widget.id };
+      if (JSON.stringify(widget) === JSON.stringify(replacement)) return widget;
+      changed = true;
+      return replacement;
+    }),
+  }));
+
+  return { spec: changed ? { rows } : spec, changed };
+}
+
 /**
  * Add default widgets introduced after a user already had a persisted layout.
  * This keeps existing custom layouts intact while still surfacing new built-ins.
@@ -140,6 +163,15 @@ export function migrateLayout(spec: DashboardSpec): {
     const added = appendDefaultWidget(next, title);
     next = added.spec;
     changed = changed || added.changed;
+  }
+
+  for (const title of [
+    "Alternating streaks (red start)",
+    "Alternating streaks (green start)",
+  ]) {
+    const refreshed = refreshDefaultWidget(next, title);
+    next = refreshed.spec;
+    changed = changed || refreshed.changed;
   }
 
   return { spec: next, changed };
