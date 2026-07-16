@@ -15,6 +15,15 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { DashboardGrid } from "@/components/dashboard-grid";
 import { ChartEditor } from "@/components/chart-editor";
 import {
@@ -33,6 +42,21 @@ import {
   replaceWidget,
   widgetId,
 } from "@/lib/layout";
+
+type ExportRange = "100" | "1000" | "10000" | "all";
+
+type CacheInfo = {
+  count: number;
+  minGameId: number | null;
+  maxGameId: number | null;
+};
+
+const EXPORT_RANGES: { value: ExportRange; label: string }[] = [
+  { value: "100", label: "100" },
+  { value: "1000", label: "1,000" },
+  { value: "10000", label: "10,000" },
+  { value: "all", label: "All" },
+];
 
 export function DashboardSection({
   game,
@@ -57,14 +81,44 @@ export function DashboardSection({
   const [exported, setExported] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportRangeOpen, setExportRangeOpen] = useState(false);
+  const [exportRange, setExportRange] = useState<ExportRange>("1000");
+  const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
+  const [cacheInfoLoading, setCacheInfoLoading] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress>({
     phase: "loading",
     current: 0,
     total: 0,
   });
 
-  // Save the whole cached game history to an .xlsx file the user picks. The
-  // workbook itself is built in Rust (see the `export_history` command).
+  async function openExportRangeDialog() {
+    setExportError(null);
+    setExported(false);
+    setExportRangeOpen(true);
+    setCacheInfoLoading(true);
+    try {
+      setCacheInfo(await invoke<CacheInfo>("load_backtest_cache_info"));
+    } catch (e) {
+      setCacheInfo(null);
+      setExportError(String(e));
+    } finally {
+      setCacheInfoLoading(false);
+    }
+  }
+
+  const selectedLimit =
+    exportRange === "all" ? null : Number.parseInt(exportRange, 10);
+  const selectedRows =
+    cacheInfo == null
+      ? null
+      : selectedLimit == null
+        ? cacheInfo.count
+        : Math.min(cacheInfo.count, selectedLimit);
+  const canExportSelected =
+    !exporting && !cacheInfoLoading && cacheInfo != null && cacheInfo.count > 0;
+
+  // Save the selected cached game history range to an .xlsx file the user picks.
+  // The workbook itself is built in Rust (see the `export_history` command).
   async function exportXlsx() {
     setExportError(null);
     setExported(false);
@@ -79,6 +133,7 @@ export function DashboardSection({
         filters: [{ name: "Excel Workbook", extensions: ["xlsx"] }],
       });
       if (!path) return; // user cancelled the dialog
+      setExportRangeOpen(false);
       setExportProgress({ phase: "loading", current: 0, total: 0 });
       setExportDialogOpen(true);
       setExporting(true);
@@ -87,7 +142,11 @@ export function DashboardSection({
         (e) => setExportProgress(e.payload),
       );
       const generatedAt = `${date} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-      const rows = await invoke<number>("export_history", { path, generatedAt });
+      const rows = await invoke<number>("export_history", {
+        path,
+        generatedAt,
+        rowLimit: selectedLimit,
+      });
       setExportProgress((p) => ({
         phase: "completed",
         current: rows,
@@ -163,7 +222,7 @@ export function DashboardSection({
           <Button
             size="sm"
             variant="outline"
-            onClick={exportXlsx}
+            onClick={openExportRangeDialog}
             disabled={exporting}
           >
             {exporting ? (
@@ -200,6 +259,81 @@ export function DashboardSection({
         editing={editing}
         onSave={onSaveChart}
       />
+
+      <Dialog
+        open={exportRangeOpen}
+        onOpenChange={(open) => {
+          if (!exporting) setExportRangeOpen(open);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Export game history</DialogTitle>
+            <DialogDescription>
+              Choose how much cached history to export, counted back from the
+              latest cached game.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-4">
+            <div className="text-sm text-muted-foreground">
+              {cacheInfoLoading ? (
+                <span className="flex items-center gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading cached history…
+                </span>
+              ) : cacheInfo && cacheInfo.count > 0 ? (
+                <span>
+                  Latest cached game #
+                  {cacheInfo.maxGameId?.toLocaleString()}.{" "}
+                  {cacheInfo.count.toLocaleString()} games available.
+                </span>
+              ) : cacheInfo ? (
+                <span>No cached games are available to export.</span>
+              ) : (
+                <span>Cached history could not be loaded.</span>
+              )}
+            </div>
+
+            <ToggleGroup
+              type="single"
+              variant="outline"
+              value={exportRange}
+              onValueChange={(value) => {
+                if (value) setExportRange(value as ExportRange);
+              }}
+            >
+              {EXPORT_RANGES.map((option) => (
+                <ToggleGroupItem key={option.value} value={option.value}>
+                  {option.label}
+                </ToggleGroupItem>
+              ))}
+            </ToggleGroup>
+
+            {selectedRows != null && cacheInfo && cacheInfo.count > 0 && (
+              <p className="text-sm text-muted-foreground">
+                {selectedRows.toLocaleString()} rows will be exported.
+              </p>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setExportRangeOpen(false)}
+              disabled={exporting}
+            >
+              Cancel
+            </Button>
+            <Button onClick={exportXlsx} disabled={!canExportSelected}>
+              {exporting && (
+                <Loader2 data-icon="inline-start" className="animate-spin" />
+              )}
+              Continue to export
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <ExportProgressDialog
         open={exportDialogOpen}

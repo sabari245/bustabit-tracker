@@ -1247,6 +1247,68 @@ async fn count_games(conn: &libsql::Connection) -> Result<u64, String> {
     Ok(c.max(0) as u64)
 }
 
+struct ExportWindow {
+    total: u64,
+    min_game_id: Option<i64>,
+    max_game_id: Option<i64>,
+}
+
+/// Resolve the exact cached game window to export. A row limit means "latest N"
+/// from the highest cached game_id; `None` exports the whole cache.
+async fn export_window(
+    conn: &libsql::Connection,
+    row_limit: Option<u64>,
+) -> Result<ExportWindow, String> {
+    let available = count_games(conn).await?;
+    if available == 0 {
+        return Ok(ExportWindow {
+            total: 0,
+            min_game_id: None,
+            max_game_id: None,
+        });
+    }
+
+    let requested = row_limit
+        .filter(|n| *n > 0)
+        .map(|n| n.min(available))
+        .unwrap_or(available);
+
+    let mut rows = if requested >= available {
+        conn.query("SELECT COUNT(*), MIN(game_id), MAX(game_id) FROM games", ())
+            .await
+            .map_err(|e| format!("export range failed: {e}"))?
+    } else {
+        conn.query(
+            "SELECT COUNT(*), MIN(game_id), MAX(game_id)
+             FROM (SELECT game_id FROM games ORDER BY game_id DESC LIMIT ?1)",
+            libsql::params![requested.min(i64::MAX as u64) as i64],
+        )
+        .await
+        .map_err(|e| format!("export range failed: {e}"))?
+    };
+
+    let row = rows
+        .next()
+        .await
+        .map_err(|e| format!("export range failed: {e}"))?
+        .ok_or_else(|| "export range returned no rows".to_string())?;
+    let total: i64 = row
+        .get(0)
+        .map_err(|e| format!("export range failed: {e}"))?;
+    let min_game_id: Option<i64> = row
+        .get(1)
+        .map_err(|e| format!("export range failed: {e}"))?;
+    let max_game_id: Option<i64> = row
+        .get(2)
+        .map_err(|e| format!("export range failed: {e}"))?;
+
+    Ok(ExportWindow {
+        total: total.max(0) as u64,
+        min_game_id,
+        max_game_id,
+    })
+}
+
 #[tauri::command]
 async fn load_backtest_cache_info(app: tauri::AppHandle) -> Result<BacktestCacheInfo, String> {
     let conn = open_db_conn(&app).await?;
@@ -1579,8 +1641,8 @@ async fn get_backtest(
     }
 }
 
-/// Export the entire cached game history to an `.xlsx` file at `path`. The whole
-/// `games` table is written — game number, provably-fair hash, the bust multiplier
+/// Export cached game history to an `.xlsx` file at `path`. The selected range of
+/// the `games` table is written — game number, provably-fair hash, the bust multiplier
 /// (centi → real ×), and the 2× green/red result — under a titled, frozen header.
 /// History larger than one Excel sheet is split across consecutive sheets. Streams
 /// rows straight from libSQL into the workbook (keyset-paginated by game_id) so the
@@ -1590,6 +1652,7 @@ async fn export_history(
     app: tauri::AppHandle,
     path: String,
     generated_at: String,
+    row_limit: Option<u64>,
 ) -> Result<u64, String> {
     let db_path = db_path(&app)?;
     let app = app.clone();
@@ -1613,7 +1676,9 @@ async fn export_history(
             report("loading", 0, 0);
             let conn = open_db_conn_at_path(db_path).await?;
 
-            let total = count_games(&conn).await?;
+            let window = export_window(&conn, row_limit).await?;
+            let total = window.total;
+            let min_game_id = window.min_game_id.unwrap_or(i64::MAX);
             report("loading", 0, total);
 
             let title_fmt = Format::new().set_bold().set_font_size(16.0);
@@ -1664,8 +1729,22 @@ async fn export_history(
                         .write_with_format(1, 0, format!("Exported {generated_at}"), &meta_fmt)
                         .map_err(|e| format!("write failed: {e}"))?;
                     sheet
-                        .write_with_format(2, 0, format!("Total games: {total}"), &meta_fmt)
+                        .write_with_format(2, 0, format!("Exported games: {total}"), &meta_fmt)
                         .map_err(|e| format!("write failed: {e}"))?;
+                    if let (Some(min), Some(max)) = (window.min_game_id, window.max_game_id) {
+                        sheet
+                            .write_with_format(
+                                3,
+                                0,
+                                format!("Game range: #{min} to #{max}"),
+                                &meta_fmt,
+                            )
+                            .map_err(|e| format!("write failed: {e}"))?;
+                    } else {
+                        sheet
+                            .write_with_format(3, 0, "Game range: no cached games", &meta_fmt)
+                            .map_err(|e| format!("write failed: {e}"))?;
+                    }
                 }
                 for (c, h) in headers.iter().enumerate() {
                     sheet
@@ -1680,8 +1759,9 @@ async fn export_history(
                 let mut rows = conn
                     .query(
                         "SELECT game_id, hash, bust_centi, is_green FROM games \
-                         WHERE game_id > ?1 ORDER BY game_id LIMIT ?2",
-                        libsql::params![last_id, XLSX_ROWS_PER_SHEET as i64],
+                         WHERE game_id >= ?1 AND game_id > ?2 \
+                         ORDER BY game_id LIMIT ?3",
+                        libsql::params![min_game_id, last_id, XLSX_ROWS_PER_SHEET as i64],
                     )
                     .await
                     .map_err(|e| format!("export query failed: {e}"))?;
@@ -1826,6 +1906,42 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn insert_game_id(conn: &libsql::Connection, game_id: i64) {
+        conn.execute(
+            "INSERT INTO games (game_id, hash, bust_centi, is_green)
+             VALUES (?1, ?2, 200, 1)",
+            libsql::params![game_id, format!("{game_id:064x}")],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_window_limits_from_highest_game() {
+        let conn = mem_conn().await;
+        for game_id in [10, 11, 12, 13] {
+            insert_game_id(&conn, game_id).await;
+        }
+
+        let window = export_window(&conn, Some(2)).await.unwrap();
+        assert_eq!(window.total, 2);
+        assert_eq!(window.min_game_id, Some(12));
+        assert_eq!(window.max_game_id, Some(13));
+    }
+
+    #[tokio::test]
+    async fn export_window_all_when_limit_exceeds_cache() {
+        let conn = mem_conn().await;
+        for game_id in [10, 11, 12, 13] {
+            insert_game_id(&conn, game_id).await;
+        }
+
+        let window = export_window(&conn, Some(10_000)).await.unwrap();
+        assert_eq!(window.total, 4);
+        assert_eq!(window.min_game_id, Some(10));
+        assert_eq!(window.max_game_id, Some(13));
     }
 
     #[tokio::test]
